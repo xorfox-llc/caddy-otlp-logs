@@ -162,7 +162,13 @@ func (w *OTLPWriter) Provision(ctx caddy.Context) error {
 	if attrs := os.Getenv("OTEL_RESOURCE_ATTRIBUTES"); attrs != "" {
 		for _, attr := range strings.Split(attrs, ",") {
 			if kv := strings.SplitN(attr, "=", 2); len(kv) == 2 {
-				w.ResourceAttributes[strings.TrimSpace(kv[0])] = strings.TrimSpace(kv[1])
+				key := strings.TrimSpace(kv[0])
+				value := strings.TrimSpace(kv[1])
+				// URL decode the value as per OTLP spec
+				if decoded, err := url.QueryUnescape(value); err == nil {
+					value = decoded
+				}
+				w.ResourceAttributes[key] = value
 			}
 		}
 	}
@@ -328,7 +334,13 @@ func (w *OTLPWriter) parseHeadersFromEnv(envVar string) {
 	if headers := os.Getenv(envVar); headers != "" {
 		for _, header := range strings.Split(headers, ",") {
 			if kv := strings.SplitN(header, "=", 2); len(kv) == 2 {
-				w.Headers[strings.TrimSpace(kv[0])] = strings.TrimSpace(kv[1])
+				key := strings.TrimSpace(kv[0])
+				value := strings.TrimSpace(kv[1])
+				// URL decode the value as per OTLP spec
+				if decoded, err := url.QueryUnescape(value); err == nil {
+					value = decoded
+				}
+				w.Headers[key] = value
 			}
 		}
 	}

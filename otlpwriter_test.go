@@ -4,13 +4,16 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"go.opentelemetry.io/otel/attribute"
+	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	logspb "go.opentelemetry.io/proto/otlp/logs/v1"
 )
 
@@ -766,12 +769,12 @@ func TestOTLPWriter_Provision_EnvVars(t *testing.T) {
 		os.Setenv("OTEL_RESOURCE_ATTRIBUTES", oldResourceAttrs)
 	}()
 	
-	// Set test env vars
+	// Set test env vars - including URL encoded values
 	os.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "otel.test.com:4317")
 	os.Setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf")
-	os.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "Authorization=Bearer test,X-Custom=value")
+	os.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "Authorization=Bearer%20test,X-Custom=value%20with%20spaces")
 	os.Setenv("OTEL_SERVICE_NAME", "test-service")
-	os.Setenv("OTEL_RESOURCE_ATTRIBUTES", "env=test,version=1.0.0")
+	os.Setenv("OTEL_RESOURCE_ATTRIBUTES", "env=test,version=1.0.0,description=Test%20Service%20Description")
 	
 	w := &OTLPWriter{}
 	ctx, cancel := caddy.NewContext(caddy.Context{
@@ -797,20 +800,26 @@ func TestOTLPWriter_Provision_EnvVars(t *testing.T) {
 		t.Errorf("Expected service name from env var, got %s", w.ServiceName)
 	}
 	
+	// Check headers are URL decoded
 	if w.Headers["Authorization"] != "Bearer test" {
-		t.Errorf("Expected Authorization header from env var, got %s", w.Headers["Authorization"])
+		t.Errorf("Expected Authorization header to be URL decoded, got %s", w.Headers["Authorization"])
 	}
 	
-	if w.Headers["X-Custom"] != "value" {
-		t.Errorf("Expected X-Custom header from env var, got %s", w.Headers["X-Custom"])
+	if w.Headers["X-Custom"] != "value with spaces" {
+		t.Errorf("Expected X-Custom header to be URL decoded, got %s", w.Headers["X-Custom"])
 	}
 	
+	// Check resource attributes are URL decoded
 	if w.ResourceAttributes["env"] != "test" {
 		t.Errorf("Expected env resource attribute from env var, got %s", w.ResourceAttributes["env"])
 	}
 	
 	if w.ResourceAttributes["version"] != "1.0.0" {
 		t.Errorf("Expected version resource attribute from env var, got %s", w.ResourceAttributes["version"])
+	}
+	
+	if w.ResourceAttributes["description"] != "Test Service Description" {
+		t.Errorf("Expected description resource attribute to be URL decoded, got %s", w.ResourceAttributes["description"])
 	}
 	
 	// Cleanup
@@ -840,5 +849,344 @@ func TestOTLPWriter_Cleanup(t *testing.T) {
 	err = w.Cleanup()
 	if err != nil {
 		t.Errorf("Second Cleanup() error = %v", err)
+	}
+}
+
+func TestOTLPWriter_BatchManagement(t *testing.T) {
+	w := &OTLPWriter{
+		logsBatch: make([]*logspb.LogRecord, 0),
+		closeChan: make(chan struct{}),
+		BatchSize: 3,
+		BatchTimeout: caddy.Duration(100 * time.Millisecond),
+	}
+	
+	// Mock log records
+	log1 := &logspb.LogRecord{TimeUnixNano: 1, Body: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "log1"}}}
+	log2 := &logspb.LogRecord{TimeUnixNano: 2, Body: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "log2"}}}
+	
+	// Test adding logs without triggering batch
+	w.addLog(log1)
+	if len(w.logsBatch) != 1 {
+		t.Errorf("Expected 1 log in batch, got %d", len(w.logsBatch))
+	}
+	
+	w.addLog(log2)
+	if len(w.logsBatch) != 2 {
+		t.Errorf("Expected 2 logs in batch, got %d", len(w.logsBatch))
+	}
+	
+	// Verify batch is not cleared until batch size is reached
+	if len(w.logsBatch) == 0 {
+		t.Error("Batch was cleared before reaching batch size")
+	}
+}
+
+func TestOTLPWriter_ProtocolValidation(t *testing.T) {
+	tests := []struct {
+		name     string
+		protocol string
+		wantErr  bool
+	}{
+		{
+			name:     "valid grpc protocol",
+			protocol: "grpc",
+			wantErr:  false,
+		},
+		{
+			name:     "valid http protocol",
+			protocol: "http/protobuf",
+			wantErr:  false,
+		},
+		{
+			name:     "valid http protocol alternative",
+			protocol: "http",
+			wantErr:  false,
+		},
+		{
+			name:     "invalid protocol",
+			protocol: "invalid",
+			wantErr:  true,
+		},
+	}
+	
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := &OTLPWriter{
+				Protocol: tt.protocol,
+				Endpoint: "localhost:4317",
+			}
+			
+			ctx, cancel := caddy.NewContext(caddy.Context{
+				Context: context.Background(),
+			})
+			defer cancel()
+			
+			err := w.Provision(ctx)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Provision() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			
+			if !tt.wantErr {
+				// Cleanup successful provisions
+				w.Cleanup()
+			}
+		})
+	}
+}
+
+func TestOTLPWriter_ParseHeaders(t *testing.T) {
+	// Save and restore env
+	oldHeaders := os.Getenv("OTEL_EXPORTER_OTLP_HEADERS")
+	defer os.Setenv("OTEL_EXPORTER_OTLP_HEADERS", oldHeaders)
+	
+	tests := []struct {
+		name     string
+		envValue string
+		expected map[string]string
+	}{
+		{
+			name:     "single header",
+			envValue: "Authorization=Bearer token123",
+			expected: map[string]string{"Authorization": "Bearer token123"},
+		},
+		{
+			name:     "multiple headers",
+			envValue: "Authorization=Bearer token123,X-Custom-Header=value",
+			expected: map[string]string{
+				"Authorization":   "Bearer token123",
+				"X-Custom-Header": "value",
+			},
+		},
+		{
+			name:     "headers with spaces",
+			envValue: "Authorization = Bearer token123 , X-Custom-Header = value",
+			expected: map[string]string{
+				"Authorization":   "Bearer token123",
+				"X-Custom-Header": "value",
+			},
+		},
+		{
+			name:     "URL encoded headers",
+			envValue: "X-Custom=value%20with%20spaces",
+			expected: map[string]string{"X-Custom": "value with spaces"},
+		},
+	}
+	
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			os.Setenv("OTEL_EXPORTER_OTLP_HEADERS", tt.envValue)
+			
+			w := &OTLPWriter{}
+			ctx, cancel := caddy.NewContext(caddy.Context{
+				Context: context.Background(),
+			})
+			defer cancel()
+			
+			err := w.Provision(ctx)
+			if err != nil {
+				t.Fatalf("Failed to provision: %v", err)
+			}
+			defer w.Cleanup()
+			
+			for k, v := range tt.expected {
+				if w.Headers[k] != v {
+					t.Errorf("Expected header %s=%s, got %s", k, v, w.Headers[k])
+				}
+			}
+		})
+	}
+}
+
+func TestOTLPWriter_EdgeCases(t *testing.T) {
+	t.Run("empty JSON log", func(t *testing.T) {
+		owc := &otlpWriteCloser{w: &OTLPWriter{}}
+		
+		_, err := owc.Write([]byte("{}"))
+		if err != nil {
+			t.Errorf("Should handle empty JSON: %v", err)
+		}
+	})
+	
+	t.Run("invalid JSON with special characters", func(t *testing.T) {
+		owc := &otlpWriteCloser{w: &OTLPWriter{
+			logsBatch: make([]*logspb.LogRecord, 0),
+			BatchSize: 100,
+		}}
+		
+		invalidJSON := `{"msg": "test with \x00 null byte"}`
+		_, err := owc.Write([]byte(invalidJSON))
+		// Should treat as plain text
+		if err != nil {
+			t.Errorf("Should handle invalid JSON as plain text: %v", err)
+		}
+	})
+	
+	t.Run("very long attribute values", func(t *testing.T) {
+		owc := &otlpWriteCloser{w: &OTLPWriter{}}
+		
+		longString := strings.Repeat("a", 10000)
+		entry := map[string]interface{}{
+			"msg":       "test",
+			"long_attr": longString,
+		}
+		
+		attrs := owc.extractAttributes(entry)
+		found := false
+		for _, attr := range attrs {
+			if attr.Key == "long_attr" {
+				found = true
+				if len(attr.GetValue().GetStringValue()) != 10000 {
+					t.Error("Long attribute value was truncated")
+				}
+			}
+		}
+		if !found {
+			t.Error("Long attribute was not extracted")
+		}
+	})
+	
+	t.Run("nested maps in attributes", func(t *testing.T) {
+		owc := &otlpWriteCloser{w: &OTLPWriter{}}
+		
+		entry := map[string]interface{}{
+			"msg": "test",
+			"nested": map[string]interface{}{
+				"level1": map[string]interface{}{
+					"level2": "value",
+				},
+			},
+		}
+		
+		attrs := owc.extractAttributes(entry)
+		found := false
+		for _, attr := range attrs {
+			if attr.Key == "nested" {
+				found = true
+				// Should be JSON stringified
+				expectedJSON := `{"level1":{"level2":"value"}}`
+				if attr.GetValue().GetStringValue() != expectedJSON {
+					t.Errorf("Expected nested map as JSON %s, got %s", expectedJSON, attr.GetValue().GetStringValue())
+				}
+			}
+		}
+		if !found {
+			t.Error("Nested attribute was not extracted")
+		}
+	})
+}
+
+func TestOTLPWriter_CaddyfileEdgeCases(t *testing.T) {
+	tests := []struct {
+		name      string
+		caddyfile string
+		wantErr   bool
+	}{
+		{
+			name: "headers with equals in value",
+			caddyfile: `otlp {
+				headers {
+					Authorization "Bearer token=with=equals"
+				}
+			}`,
+			wantErr: false,
+		},
+		{
+			name: "resource attributes with special characters",
+			caddyfile: `otlp {
+				resource_attributes {
+					"service.namespace" "my-namespace"
+					deployment.environment "prod/staging"
+				}
+			}`,
+			wantErr: false,
+		},
+		{
+			name: "timeout with units",
+			caddyfile: `otlp {
+				timeout 30s
+				batch_timeout 500ms
+			}`,
+			wantErr: false,
+		},
+		{
+			name: "missing closing brace in headers",
+			caddyfile: `otlp {
+				headers {
+					Authorization "Bearer token"
+			}`,
+			wantErr: false, // TestDispenser doesn't validate braces properly
+		},
+		{
+			name: "duplicate directives",
+			caddyfile: `otlp {
+				endpoint localhost:4317
+				endpoint localhost:4318
+			}`,
+			wantErr: false, // Last one wins
+		},
+	}
+	
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := &OTLPWriter{}
+			d := caddyfile.NewTestDispenser(tt.caddyfile)
+			
+			err := w.UnmarshalCaddyfile(d)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("UnmarshalCaddyfile() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestOTLPWriter_AttributeValueEdgeCases(t *testing.T) {
+	tests := []struct {
+		name  string
+		value interface{}
+	}{
+		{
+			name:  "nil value",
+			value: nil,
+		},
+		{
+			name:  "empty slice",
+			value: []interface{}{},
+		},
+		{
+			name:  "mixed type slice",
+			value: []interface{}{"string", 123, true, 3.14},
+		},
+		{
+			name:  "very large int",
+			value: int64(9223372036854775807), // max int64
+		},
+		{
+			name:  "very small float",
+			value: 1e-308,
+		},
+		{
+			name:  "Infinity float",
+			value: math.Inf(1),
+		},
+		{
+			name:  "complex nested structure",
+			value: map[string]interface{}{
+				"array": []interface{}{
+					map[string]interface{}{
+						"nested": "value",
+					},
+				},
+			},
+		},
+	}
+	
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Should not panic
+			attr := attributeValue(tt.value)
+			if attr.Type() == attribute.INVALID {
+				t.Errorf("Got INVALID attribute type for %v", tt.value)
+			}
+		})
 	}
 }
