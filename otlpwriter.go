@@ -83,6 +83,7 @@ type OTLPWriter struct {
 	batchTimer   *time.Timer
 	closed       bool
 	closeChan    chan struct{}
+	failedBatches int64
 }
 
 // CaddyModule returns the Caddy module information.
@@ -252,7 +253,9 @@ func (w *OTLPWriter) Cleanup() error {
 
 	// Send any remaining logs
 	if len(w.logsBatch) > 0 {
-		_ = w.sendBatch()
+		if err := w.sendBatch(); err != nil {
+			w.reportBatchError(err, len(w.logsBatch), "Cleanup")
+		}
 	}
 
 	// Clean up connections
@@ -376,7 +379,10 @@ func (w *OTLPWriter) batchProcessor() {
 		case <-ticker.C:
 			w.mu.Lock()
 			if len(w.logsBatch) > 0 {
-				_ = w.sendBatch()
+				logCount := len(w.logsBatch)
+				if err := w.sendBatch(); err != nil {
+					w.reportBatchError(err, logCount, "batchProcessor timeout")
+				}
 			}
 			w.mu.Unlock()
 		}
@@ -391,8 +397,39 @@ func (w *OTLPWriter) addLog(record *logspb.LogRecord) {
 	w.logsBatch = append(w.logsBatch, record)
 
 	if len(w.logsBatch) >= w.BatchSize {
-		_ = w.sendBatch()
+		logCount := len(w.logsBatch)
+		if err := w.sendBatch(); err != nil {
+			w.reportBatchError(err, logCount, "addLog batch size threshold")
+		}
 	}
+}
+
+// reportBatchError reports batch send errors to stderr for visibility in containerized environments
+func (w *OTLPWriter) reportBatchError(err error, logCount int, location string) {
+	if err == nil {
+		return
+	}
+
+	w.failedBatches++
+	
+	// Write to stderr for immediate container visibility
+	fmt.Fprintf(os.Stderr, "[CRITICAL] OTLP log export failed at %s\n", location)
+	fmt.Fprintf(os.Stderr, "  Endpoint: %s (%s)\n", w.Endpoint, w.Protocol)
+	fmt.Fprintf(os.Stderr, "  Error: %v\n", err)
+	fmt.Fprintf(os.Stderr, "  Lost logs: %d\n", logCount)
+	fmt.Fprintf(os.Stderr, "  Total failed batches: %d\n", w.failedBatches)
+	fmt.Fprintf(os.Stderr, "  Service: %s\n", w.ServiceName)
+	fmt.Fprintf(os.Stderr, "  Time: %s\n", time.Now().Format(time.RFC3339))
+	
+	// Also log structured error for debugging
+	w.logger.Error("OTLP log export failed",
+		zap.Error(err),
+		zap.String("location", location),
+		zap.String("endpoint", w.Endpoint),
+		zap.String("protocol", w.Protocol),
+		zap.Int("lost_logs", logCount),
+		zap.Int64("total_failed_batches", w.failedBatches),
+	)
 }
 
 // sendBatch sends the current batch of logs.
@@ -517,7 +554,12 @@ func (owc *otlpWriteCloser) Close() error {
 	// Force flush
 	owc.w.mu.Lock()
 	defer owc.w.mu.Unlock()
-	return owc.w.sendBatch()
+	logCount := len(owc.w.logsBatch)
+	if err := owc.w.sendBatch(); err != nil {
+		owc.w.reportBatchError(err, logCount, "Close")
+		return err
+	}
+	return nil
 }
 
 // extractLevel extracts the log level string.
