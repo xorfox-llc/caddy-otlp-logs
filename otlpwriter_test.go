@@ -999,7 +999,16 @@ func TestOTLPWriter_ParseHeaders(t *testing.T) {
 
 func TestOTLPWriter_EdgeCases(t *testing.T) {
 	t.Run("empty JSON log", func(t *testing.T) {
-		owc := &otlpWriteCloser{w: &OTLPWriter{}}
+		w := &OTLPWriter{
+			logsBatch: make([]*logspb.LogRecord, 0),
+			BatchSize: 100,
+			circuitBreaker: &circuitBreaker{
+				state: circuitClosed,
+			},
+			retryQueue: make(chan *retryItem, 10),
+			closeChan: make(chan struct{}),
+		}
+		owc := &otlpWriteCloser{w: w}
 		
 		_, err := owc.Write([]byte("{}"))
 		if err != nil {
@@ -1008,10 +1017,16 @@ func TestOTLPWriter_EdgeCases(t *testing.T) {
 	})
 	
 	t.Run("invalid JSON with special characters", func(t *testing.T) {
-		owc := &otlpWriteCloser{w: &OTLPWriter{
+		w := &OTLPWriter{
 			logsBatch: make([]*logspb.LogRecord, 0),
 			BatchSize: 100,
-		}}
+			circuitBreaker: &circuitBreaker{
+				state: circuitClosed,
+			},
+			retryQueue: make(chan *retryItem, 10),
+			closeChan: make(chan struct{}),
+		}
+		owc := &otlpWriteCloser{w: w}
 		
 		invalidJSON := `{"msg": "test with \x00 null byte"}`
 		_, err := owc.Write([]byte(invalidJSON))
