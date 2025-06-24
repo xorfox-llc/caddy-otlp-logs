@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/sdk/resource"
 	collectorlogspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
@@ -557,12 +558,14 @@ func (owc *otlpWriteCloser) extractMessage(entry map[string]interface{}) string 
 		return msg
 	}
 	// For Caddy access logs, construct message from request info
-	if method, ok := entry["request"].(map[string]interface{})["method"].(string); ok {
-		if uri, ok := entry["request"].(map[string]interface{})["uri"].(string); ok {
-			if status, ok := entry["status"].(float64); ok {
-				return fmt.Sprintf("%s %s %d", method, uri, int(status))
+	if request, ok := entry["request"].(map[string]interface{}); ok {
+		if method, ok := request["method"].(string); ok {
+			if uri, ok := request["uri"].(string); ok {
+				if status, ok := entry["status"].(float64); ok {
+					return fmt.Sprintf("%s %s %d", method, uri, int(status))
+				}
+				return fmt.Sprintf("%s %s", method, uri)
 			}
-			return fmt.Sprintf("%s %s", method, uri)
 		}
 	}
 	// Fallback to JSON representation
@@ -694,6 +697,13 @@ func parseTraceID(s string) ([]byte, error) {
 		return nil, fmt.Errorf("invalid trace ID length: %d", len(s))
 	}
 	
+	// Validate all characters are hex
+	for _, c := range s {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return nil, fmt.Errorf("invalid hex character in trace ID: %c", c)
+		}
+	}
+	
 	data := make([]byte, 16)
 	for i := 0; i < 16; i++ {
 		var b byte
@@ -715,6 +725,13 @@ func parseSpanID(s string) ([]byte, error) {
 		return nil, fmt.Errorf("invalid span ID length: %d", len(s))
 	}
 	
+	// Validate all characters are hex
+	for _, c := range s {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return nil, fmt.Errorf("invalid hex character in span ID: %c", c)
+		}
+	}
+	
 	data := make([]byte, 8)
 	for i := 0; i < 8; i++ {
 		var b byte
@@ -727,10 +744,134 @@ func parseSpanID(s string) ([]byte, error) {
 	return data, nil
 }
 
+// UnmarshalCaddyfile implements caddyfile.Unmarshaler.
+// Syntax:
+//
+//	otlp {
+//	    endpoint <url>
+//	    protocol <grpc|http>
+//	    insecure [true|false]
+//	    timeout <duration>
+//	    headers {
+//	        <name> <value>
+//	    }
+//	    service_name <name>
+//	    resource_attributes {
+//	        <name> <value>
+//	    }
+//	    batch_size <size>
+//	    batch_timeout <duration>
+//	}
+func (w *OTLPWriter) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	for d.Next() {
+		// No arguments on the same line  
+		if d.NextArg() {
+			return d.ArgErr()
+		}
+
+		for d.NextBlock(0) {
+			switch d.Val() {
+			case "endpoint":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				w.Endpoint = d.Val()
+
+			case "protocol":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				w.Protocol = d.Val()
+
+			case "insecure":
+				if d.NextArg() {
+					val := d.Val()
+					if val == "true" {
+						w.Insecure = true
+					} else if val == "false" {
+						w.Insecure = false
+					} else {
+						return d.Errf("insecure must be 'true' or 'false', got '%s'", val)
+					}
+				} else {
+					w.Insecure = true
+				}
+
+			case "timeout":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				dur, err := caddy.ParseDuration(d.Val())
+				if err != nil {
+					return d.Errf("invalid timeout duration: %v", err)
+				}
+				w.Timeout = caddy.Duration(dur)
+
+			case "headers":
+				if w.Headers == nil {
+					w.Headers = make(map[string]string)
+				}
+				for d.NextBlock(1) {
+					name := d.Val()
+					if !d.NextArg() {
+						return d.ArgErr()
+					}
+					w.Headers[name] = d.Val()
+				}
+
+			case "service_name":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				w.ServiceName = d.Val()
+
+			case "resource_attributes":
+				if w.ResourceAttributes == nil {
+					w.ResourceAttributes = make(map[string]string)
+				}
+				for d.NextBlock(1) {
+					name := d.Val()
+					if !d.NextArg() {
+						return d.ArgErr()
+					}
+					w.ResourceAttributes[name] = d.Val()
+				}
+
+			case "batch_size":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				var size int
+				_, err := fmt.Sscanf(d.Val(), "%d", &size)
+				if err != nil {
+					return d.Errf("invalid batch_size: %v", err)
+				}
+				w.BatchSize = size
+
+			case "batch_timeout":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				dur, err := caddy.ParseDuration(d.Val())
+				if err != nil {
+					return d.Errf("invalid batch_timeout duration: %v", err)
+				}
+				w.BatchTimeout = caddy.Duration(dur)
+
+			default:
+				return d.Errf("unrecognized subdirective: %s", d.Val())
+			}
+		}
+	}
+
+	return nil
+}
+
 // Interface guards
 var (
 	_ caddy.Module          = (*OTLPWriter)(nil)
 	_ caddy.Provisioner     = (*OTLPWriter)(nil)
 	_ caddy.WriterOpener    = (*OTLPWriter)(nil)
 	_ caddy.CleanerUpper    = (*OTLPWriter)(nil)
+	_ caddyfile.Unmarshaler = (*OTLPWriter)(nil)
 )
