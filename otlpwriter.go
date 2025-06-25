@@ -192,6 +192,9 @@ func (*OTLPWriter) CaddyModule() caddy.ModuleInfo {
 // Provision sets up the OTLP writer.
 func (w *OTLPWriter) Provision(ctx caddy.Context) error {
 	w.logger = ctx.Logger(w)
+	if w.logger == nil {
+		return fmt.Errorf("failed to get logger from context")
+	}
 	w.closeChan = make(chan struct{})
 
 	// Check for debug flag from environment variable
@@ -1277,6 +1280,9 @@ func (w *OTLPWriter) retryWorker() {
 		w.logger.Debug("retry worker started")
 	}
 	defer func() {
+		if r := recover(); r != nil {
+			w.logger.Error("retry worker panic recovered", zap.Any("panic", r))
+		}
 		if w.Debug {
 			w.logger.Debug("retry worker shutting down")
 		}
@@ -1347,7 +1353,7 @@ func (w *OTLPWriter) retryWorker() {
 					}
 					item.nextRetry = time.Now().Add(delay)
 					
-					// Try to requeue
+					// Try to requeue - check if queue is still open
 					select {
 					case w.retryQueue <- item:
 						w.logger.Warn("requeued failed batch for retry",
