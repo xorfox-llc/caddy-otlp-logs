@@ -204,8 +204,16 @@ func (w *OTLPWriter) Provision(ctx caddy.Context) error {
 		}
 	}
 
-	if w.Debug {
-		w.logger.Info("OTLP writer debug mode enabled")
+	if w.Debug && w.logger != nil {
+		// Protect against potential logger panic during provision
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					// Silently ignore logger panics during provision
+				}
+			}()
+			w.logger.Info("OTLP writer debug mode enabled")
+		}()
 	}
 
 	// Set defaults from environment variables
@@ -345,27 +353,58 @@ func (w *OTLPWriter) Provision(ctx caddy.Context) error {
 		return fmt.Errorf("unsupported protocol: %s (supported: grpc, http/protobuf)", w.Protocol)
 	}
 
-	w.logger.Info("OTLP log writer configured",
-		zap.String("endpoint", w.Endpoint),
-		zap.String("protocol", w.Protocol),
-		zap.String("service_name", w.ServiceName),
-	)
+	// Only log if logger is fully initialized to avoid panic during config reloads
+	if w.logger != nil {
+		// Use defer to catch any potential panic from logger operations
+		defer func() {
+			if r := recover(); r != nil {
+				// Silently ignore logger panics during provision
+			}
+		}()
+		
+		w.logger.Info("OTLP log writer configured",
+			zap.String("endpoint", w.Endpoint),
+			zap.String("protocol", w.Protocol),
+			zap.String("service_name", w.ServiceName),
+		)
+	}
 
 	// Start batch processor
-	if w.Debug {
-		w.logger.Debug("starting batch processor worker")
+	if w.Debug && w.logger != nil {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					// Silently ignore logger panics during provision
+				}
+			}()
+			w.logger.Debug("starting batch processor worker")
+		}()
 	}
 	go w.batchProcessor()
 
 	// Start retry worker
-	if w.Debug {
-		w.logger.Debug("starting retry worker")
+	if w.Debug && w.logger != nil {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					// Silently ignore logger panics during provision
+				}
+			}()
+			w.logger.Debug("starting retry worker")
+		}()
 	}
 	go w.retryWorker()
 	
 	// Start connection monitor
-	if w.Debug {
-		w.logger.Debug("starting connection monitor worker")
+	if w.Debug && w.logger != nil {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					// Silently ignore logger panics during provision
+				}
+			}()
+			w.logger.Debug("starting connection monitor worker")
+		}()
 	}
 	go w.connectionMonitor()
 
