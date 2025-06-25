@@ -99,6 +99,10 @@ type OTLPWriter struct {
 
 	// Circuit breaker state
 	circuitBreaker *circuitBreaker
+	
+	// Connection health
+	lastSuccessfulSend time.Time
+	connectionHealthy  bool
 }
 
 // retryItem represents a batch to be retried
@@ -123,6 +127,32 @@ const (
 	circuitOpen
 	circuitHalfOpen
 )
+
+// drainOldestFromRetryQueue attempts to remove the oldest item from retry queue
+func (w *OTLPWriter) drainOldestFromRetryQueue() bool {
+	select {
+	case <-w.retryQueue:
+		return true
+	default:
+		return false
+	}
+}
+
+// checkConnectionHealth performs a health check on the connection
+func (w *OTLPWriter) checkConnectionHealth() {
+	w.mu.Lock()
+	timeSinceLastSuccess := time.Since(w.lastSuccessfulSend)
+	w.mu.Unlock()
+	
+	// If we haven't sent successfully in a while, try to reconnect
+	if timeSinceLastSuccess > 2*time.Minute {
+		w.logger.Warn("no successful sends recently, attempting reconnection",
+			zap.Duration("time_since_last_success", timeSinceLastSuccess))
+		if err := w.reconnect(); err != nil {
+			w.logger.Error("health check reconnection failed", zap.Error(err))
+		}
+	}
+}
 
 // CaddyModule returns the Caddy module information.
 func (*OTLPWriter) CaddyModule() caddy.ModuleInfo {
@@ -233,6 +263,8 @@ func (w *OTLPWriter) Provision(ctx caddy.Context) error {
 	w.circuitBreaker = &circuitBreaker{
 		state: circuitClosed,
 	}
+	w.lastSuccessfulSend = time.Now()
+	w.connectionHealthy = true
 
 	// Create resource
 	attrs := []attribute.KeyValue{
@@ -283,6 +315,9 @@ func (w *OTLPWriter) Provision(ctx caddy.Context) error {
 
 	// Start retry worker
 	go w.retryWorker()
+	
+	// Start connection monitor
+	go w.connectionMonitor()
 
 	return nil
 }
@@ -305,24 +340,60 @@ func (w *OTLPWriter) OpenWriter() (io.WriteCloser, error) {
 // Cleanup shuts down the OTLP exporter.
 func (w *OTLPWriter) Cleanup() error {
 	w.mu.Lock()
-	defer w.mu.Unlock()
-
+	
 	if w.closed {
+		w.mu.Unlock()
 		return nil
 	}
 	w.closed = true
-	close(w.closeChan)
-
-	// Send any remaining logs
+	
+	// Make a final attempt to send remaining logs
 	if len(w.logsBatch) > 0 {
+		logCount := len(w.logsBatch)
+		// Force circuit breaker to closed for final attempt
+		w.circuitBreaker.mu.Lock()
+		w.circuitBreaker.state = circuitClosed
+		w.circuitBreaker.mu.Unlock()
+		
 		if err := w.sendBatch(); err != nil {
-			w.reportBatchError(err, len(w.logsBatch), "Cleanup")
+			w.reportBatchError(err, logCount, "Cleanup")
 		}
 	}
+	w.mu.Unlock()
+	
+	// Signal shutdown
+	close(w.closeChan)
 
-	// Wait for retry worker to finish
-	if w.retryWorkerDone != nil {
+	// Process any remaining items in retry queue with extended timeout
+	if w.retryQueue != nil && len(w.retryQueue) > 0 {
+		w.logger.Info("processing remaining retry queue items", 
+			zap.Int("count", len(w.retryQueue)))
+		
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		
+		for len(w.retryQueue) > 0 {
+			select {
+			case item := <-w.retryQueue:
+				if err := w.sendBatchWithRetryContext(ctx, item.logs); err != nil {
+					w.logger.Error("failed to send batch during cleanup",
+						zap.Error(err),
+						zap.Int("logs", len(item.logs)))
+				}
+			case <-ctx.Done():
+				w.logger.Warn("cleanup timeout reached, some logs may be lost",
+					zap.Int("remaining", len(w.retryQueue)))
+				break
+			}
+		}
+	}
+	
+	// Close retry queue and wait for worker
+	if w.retryQueue != nil {
 		close(w.retryQueue)
+	}
+	
+	if w.retryWorkerDone != nil {
 		select {
 		case <-w.retryWorkerDone:
 		case <-time.After(5 * time.Second):
@@ -346,10 +417,26 @@ func (w *OTLPWriter) initGRPCClient() error {
 		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(64 * 1024 * 1024)),
 		// Add keepalive parameters to detect stale connections
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
-			Time:                20 * time.Second, // Send pings every 20 seconds
-			Timeout:             10 * time.Second, // Wait 10 seconds for ping ack
+			Time:                10 * time.Second, // Send pings every 10 seconds (reduced from 20)
+			Timeout:             5 * time.Second,  // Wait 5 seconds for ping ack (reduced from 10)
 			PermitWithoutStream: true,             // Send pings even without active streams
 		}),
+		// Add connection timeout
+		grpc.WithBlock(),
+		grpc.WithTimeout(30 * time.Second),
+		// Enable retries for transient failures
+		grpc.WithDefaultServiceConfig(`{
+			"methodConfig": [{
+				"name": [{"service": "opentelemetry.proto.collector.logs.v1.LogsService"}],
+				"retryPolicy": {
+					"maxAttempts": 3,
+					"initialBackoff": "0.1s",
+					"maxBackoff": "1s",
+					"backoffMultiplier": 2,
+					"retryableStatusCodes": ["UNAVAILABLE", "DEADLINE_EXCEEDED"]
+				}
+			}]
+		}`),
 	}
 
 	if w.Insecure {
@@ -363,13 +450,31 @@ func (w *OTLPWriter) initGRPCClient() error {
 		opts = append(opts, grpc.WithUnaryInterceptor(w.grpcHeadersInterceptor()))
 	}
 
-	conn, err := grpc.Dial(endpoint, opts...)
+	// Create connection with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	
+	conn, err := grpc.DialContext(ctx, endpoint, opts...)
 	if err != nil {
-		return fmt.Errorf("failed to create gRPC connection: %w", err)
+		return fmt.Errorf("failed to create gRPC connection to %s: %w", endpoint, err)
 	}
 
 	w.grpcConn = conn
 	w.grpcClient = collectorlogspb.NewLogsServiceClient(conn)
+	
+	// Test the connection
+	testCtx, testCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer testCancel()
+	
+	_, testErr := w.grpcClient.Export(testCtx, &collectorlogspb.ExportLogsServiceRequest{
+		ResourceLogs: []*logspb.ResourceLogs{},
+	})
+	
+	// Ignore NOT_FOUND errors as some servers don't handle empty requests well
+	if testErr != nil && !strings.Contains(testErr.Error(), "NOT_FOUND") {
+		w.logger.Warn("initial gRPC connection test failed", zap.Error(testErr))
+	}
+	
 	return nil
 }
 
@@ -505,9 +610,18 @@ func (w *OTLPWriter) batchProcessor() {
 		case <-ticker.C:
 			w.mu.Lock()
 			if len(w.logsBatch) > 0 {
-				logCount := len(w.logsBatch)
-				if err := w.sendBatch(); err != nil {
-					w.reportBatchError(err, logCount, "batchProcessor timeout")
+				// Check if circuit breaker allows sending
+				if w.circuitBreaker.canSend() {
+					logCount := len(w.logsBatch)
+					if err := w.sendBatch(); err != nil {
+						if !strings.Contains(err.Error(), "circuit breaker is open") {
+							w.reportBatchError(err, logCount, "batchProcessor timeout")
+						}
+					}
+				} else {
+					// Circuit breaker is open, keep batch for later
+					w.logger.Debug("skipping batch send due to open circuit breaker",
+						zap.Int("pending_logs", len(w.logsBatch)))
 				}
 			}
 			w.mu.Unlock()
@@ -523,9 +637,40 @@ func (w *OTLPWriter) addLog(record *logspb.LogRecord) {
 	w.logsBatch = append(w.logsBatch, record)
 
 	if len(w.logsBatch) >= w.BatchSize {
-		logCount := len(w.logsBatch)
-		if err := w.sendBatch(); err != nil {
-			w.reportBatchError(err, logCount, "addLog batch size threshold")
+		// Check if circuit breaker allows sending
+		if w.circuitBreaker.canSend() {
+			logCount := len(w.logsBatch)
+			if err := w.sendBatch(); err != nil {
+				if !strings.Contains(err.Error(), "circuit breaker is open") {
+					w.reportBatchError(err, logCount, "addLog batch size threshold")
+				}
+			}
+		} else {
+			// Circuit breaker is open, but batch is full
+			// Try to queue for retry
+			if len(w.logsBatch) > w.BatchSize*2 {
+				// Batch is getting too large, force send to retry queue
+				batchCopy := make([]*logspb.LogRecord, len(w.logsBatch))
+				copy(batchCopy, w.logsBatch)
+				
+				select {
+				case w.retryQueue <- &retryItem{
+					logs:      batchCopy,
+					attempts:  0,
+					nextRetry: time.Now().Add(5 * time.Second),
+				}:
+					w.logsBatch = w.logsBatch[:0]
+					w.logger.Warn("circuit breaker open, queued oversized batch",
+						zap.Int("logs", len(batchCopy)))
+				default:
+					// Retry queue full, have to drop oldest logs
+					dropped := len(w.logsBatch) - w.BatchSize
+					w.logsBatch = w.logsBatch[dropped:]
+					w.logger.Error("circuit breaker open and retry queue full, dropping oldest logs",
+						zap.Int("dropped", dropped))
+					w.reportBatchError(fmt.Errorf("forced drop due to buffer overflow"), dropped, "addLog overflow")
+				}
+			}
 		}
 	}
 }
@@ -564,36 +709,70 @@ func (w *OTLPWriter) sendBatch() error {
 		return nil
 	}
 
-	// Make a copy of the batch for potential retry
+	// Make a copy of the batch for sending
 	batchCopy := make([]*logspb.LogRecord, len(w.logsBatch))
 	copy(batchCopy, w.logsBatch)
 	
-	// Clear batch immediately to avoid blocking new logs
-	w.logsBatch = w.logsBatch[:0]
-
-	// Try to send the batch
-	if err := w.sendBatchWithRetry(batchCopy); err != nil {
-		// Queue for retry if not circuit breaker open
-		if !strings.Contains(err.Error(), "circuit breaker is open") {
+	// Try to send the batch first before clearing
+	err := w.sendBatchWithRetry(batchCopy)
+	
+	// Only clear batch if send was successful
+	if err == nil {
+		w.logsBatch = w.logsBatch[:0]
+		return nil
+	}
+	
+	// Send failed - handle the error
+	// Check if circuit breaker is open
+	if strings.Contains(err.Error(), "circuit breaker is open") {
+		// Don't clear batch yet - will retry when circuit breaker closes
+		w.logger.Debug("circuit breaker open, keeping batch for later retry", 
+			zap.Int("logs", len(w.logsBatch)))
+		return err
+	}
+	
+	// Try to queue for retry
+	select {
+	case w.retryQueue <- &retryItem{
+		logs:      batchCopy,
+		attempts:  0,
+		nextRetry: time.Now().Add(time.Duration(w.RetryDelay)),
+	}:
+		// Successfully queued - clear the batch
+		w.logsBatch = w.logsBatch[:0]
+		w.logger.Warn("queued failed batch for retry",
+			zap.Int("logs", len(batchCopy)),
+			zap.Error(err))
+	default:
+		// Retry queue is full - try to send oldest items first
+		if w.drainOldestFromRetryQueue() {
+			// Try again after making space
 			select {
 			case w.retryQueue <- &retryItem{
 				logs:      batchCopy,
 				attempts:  0,
 				nextRetry: time.Now().Add(time.Duration(w.RetryDelay)),
 			}:
-				w.logger.Warn("queued failed batch for retry",
-					zap.Int("logs", len(batchCopy)),
-					zap.Error(err))
+				w.logsBatch = w.logsBatch[:0]
+				w.logger.Warn("queued failed batch for retry after draining old items",
+					zap.Int("logs", len(batchCopy)))
 			default:
-				w.logger.Error("retry queue full, dropping batch",
+				// Still full - have to drop
+				w.logsBatch = w.logsBatch[:0]
+				w.logger.Error("retry queue full after drain attempt, dropping batch",
 					zap.Int("logs", len(batchCopy)))
 				w.reportBatchError(fmt.Errorf("retry queue full"), len(batchCopy), "sendBatch")
 			}
+		} else {
+			// Couldn't drain - drop the batch
+			w.logsBatch = w.logsBatch[:0]
+			w.logger.Error("retry queue full, dropping batch",
+				zap.Int("logs", len(batchCopy)))
+			w.reportBatchError(fmt.Errorf("retry queue full"), len(batchCopy), "sendBatch")
 		}
-		return err
 	}
-
-	return nil
+	
+	return err
 }
 
 // otlpWriteCloser implements io.WriteCloser for the OTLP writer.
@@ -1002,6 +1181,10 @@ func (w *OTLPWriter) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 // retryWorker processes failed batches from the retry queue
 func (w *OTLPWriter) retryWorker() {
 	defer close(w.retryWorkerDone)
+	
+	// Create a timer for periodic health checks
+	healthCheckTicker := time.NewTicker(30 * time.Second)
+	defer healthCheckTicker.Stop()
 
 	for {
 		select {
@@ -1010,22 +1193,54 @@ func (w *OTLPWriter) retryWorker() {
 				return // Channel closed
 			}
 
-			// Wait until retry time
+			// Wait until retry time with timeout protection
 			waitTime := time.Until(item.nextRetry)
 			if waitTime > 0 {
+				// Cap wait time to prevent excessive blocking
+				maxWait := 5 * time.Minute
+				if waitTime > maxWait {
+					waitTime = maxWait
+				}
+				
+				waitTimer := time.NewTimer(waitTime)
 				select {
-				case <-time.After(waitTime):
+				case <-waitTimer.C:
 				case <-w.closeChan:
+					waitTimer.Stop()
 					return
 				}
 			}
 
-			// Try to send the batch
-			if err := w.sendBatchWithRetry(item.logs); err != nil {
+			// Check if we should skip retry due to circuit breaker
+			if !w.circuitBreaker.canSend() {
+				// Requeue for later
+				item.nextRetry = time.Now().Add(10 * time.Second)
+				select {
+				case w.retryQueue <- item:
+					w.logger.Debug("requeued item due to circuit breaker",
+						zap.Int("logs", len(item.logs)))
+				default:
+					w.logger.Warn("retry queue full while circuit breaker open",
+						zap.Int("logs", len(item.logs)))
+				}
+				continue
+			}
+
+			// Try to send the batch with timeout
+			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(w.Timeout))
+			err := w.sendBatchWithRetryContext(ctx, item.logs)
+			cancel()
+			
+			if err != nil {
 				item.attempts++
 				if item.attempts < w.MaxRetries {
 					// Calculate next retry with exponential backoff
 					delay := time.Duration(w.RetryDelay) * time.Duration(1<<uint(item.attempts))
+					// Cap maximum delay
+					maxDelay := 5 * time.Minute
+					if delay > maxDelay {
+						delay = maxDelay
+					}
 					item.nextRetry = time.Now().Add(delay)
 					
 					// Try to requeue
@@ -1033,8 +1248,9 @@ func (w *OTLPWriter) retryWorker() {
 					case w.retryQueue <- item:
 						w.logger.Warn("requeued failed batch for retry",
 							zap.Int("attempt", item.attempts),
-							zap.Time("next_retry", item.nextRetry),
-							zap.Int("logs", len(item.logs)))
+							zap.Duration("next_delay", delay),
+							zap.Int("logs", len(item.logs)),
+							zap.Error(err))
 					default:
 						w.logger.Error("retry queue full, dropping batch",
 							zap.Int("logs", len(item.logs)))
@@ -1043,10 +1259,19 @@ func (w *OTLPWriter) retryWorker() {
 				} else {
 					w.logger.Error("max retries exceeded, dropping batch",
 						zap.Int("logs", len(item.logs)),
-						zap.Int("attempts", item.attempts))
-					w.reportBatchError(fmt.Errorf("max retries exceeded"), len(item.logs), "retryWorker")
+						zap.Int("attempts", item.attempts),
+						zap.Error(err))
+					w.reportBatchError(fmt.Errorf("max retries exceeded: %w", err), len(item.logs), "retryWorker")
 				}
+			} else {
+				w.logger.Info("successfully sent retried batch",
+					zap.Int("logs", len(item.logs)),
+					zap.Int("attempts", item.attempts))
 			}
+			
+		case <-healthCheckTicker.C:
+			// Periodic health check
+			w.checkConnectionHealth()
 
 		case <-w.closeChan:
 			return
@@ -1056,6 +1281,13 @@ func (w *OTLPWriter) retryWorker() {
 
 // sendBatchWithRetry sends a batch with circuit breaker and connection recovery
 func (w *OTLPWriter) sendBatchWithRetry(logs []*logspb.LogRecord) error {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(w.Timeout))
+	defer cancel()
+	return w.sendBatchWithRetryContext(ctx, logs)
+}
+
+// sendBatchWithRetryContext sends a batch with circuit breaker, connection recovery, and context support
+func (w *OTLPWriter) sendBatchWithRetryContext(ctx context.Context, logs []*logspb.LogRecord) error {
 	// Check circuit breaker
 	if !w.circuitBreaker.canSend() {
 		return fmt.Errorf("circuit breaker is open")
@@ -1082,14 +1314,18 @@ func (w *OTLPWriter) sendBatchWithRetry(logs []*logspb.LogRecord) error {
 	var err error
 	// Send based on protocol
 	if w.grpcClient != nil {
-		err = w.sendViaGRPC(req)
+		err = w.sendViaGRPCContext(ctx, req)
 	} else if w.httpClient != nil {
-		err = w.sendViaHTTP(req)
+		err = w.sendViaHTTPContext(ctx, req)
 	}
 
-	// Update circuit breaker
+	// Update circuit breaker and connection health
 	if err != nil {
 		w.circuitBreaker.recordFailure()
+		w.mu.Lock()
+		w.connectionHealthy = false
+		w.mu.Unlock()
+		
 		// Check if we need to reconnect
 		if w.isConnectionError(err) {
 			w.logger.Warn("detected connection error, attempting to reconnect", zap.Error(err))
@@ -1099,6 +1335,10 @@ func (w *OTLPWriter) sendBatchWithRetry(logs []*logspb.LogRecord) error {
 		}
 	} else {
 		w.circuitBreaker.recordSuccess()
+		w.mu.Lock()
+		w.lastSuccessfulSend = time.Now()
+		w.connectionHealthy = true
+		w.mu.Unlock()
 	}
 
 	return err
@@ -1108,19 +1348,30 @@ func (w *OTLPWriter) sendBatchWithRetry(logs []*logspb.LogRecord) error {
 func (w *OTLPWriter) sendViaGRPC(req *collectorlogspb.ExportLogsServiceRequest) error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(w.Timeout))
 	defer cancel()
-	
+	return w.sendViaGRPCContext(ctx, req)
+}
+
+// sendViaGRPCContext sends logs via gRPC with context
+func (w *OTLPWriter) sendViaGRPCContext(ctx context.Context, req *collectorlogspb.ExportLogsServiceRequest) error {
 	_, err := w.grpcClient.Export(ctx, req)
 	return err
 }
 
 // sendViaHTTP sends logs via HTTP with proper error handling
 func (w *OTLPWriter) sendViaHTTP(req *collectorlogspb.ExportLogsServiceRequest) error {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(w.Timeout))
+	defer cancel()
+	return w.sendViaHTTPContext(ctx, req)
+}
+
+// sendViaHTTPContext sends logs via HTTP with context
+func (w *OTLPWriter) sendViaHTTPContext(ctx context.Context, req *collectorlogspb.ExportLogsServiceRequest) error {
 	data, err := proto.Marshal(req)
 	if err != nil {
 		return fmt.Errorf("failed to marshal logs: %w", err)
 	}
 
-	httpReq, err := http.NewRequest("POST", w.httpEndpoint, bytes.NewReader(data))
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", w.httpEndpoint, bytes.NewReader(data))
 	if err != nil {
 		return fmt.Errorf("failed to create HTTP request: %w", err)
 	}
@@ -1160,6 +1411,10 @@ func (w *OTLPWriter) isConnectionError(err error) bool {
 		"transport is closing",
 		"connection closed",
 		"EOF",
+		"context deadline exceeded",
+		"i/o timeout",
+		"connection timed out",
+		"no route to host",
 	}
 	
 	for _, connErr := range connectionErrors {
@@ -1194,6 +1449,21 @@ func (w *OTLPWriter) reconnect() error {
 	}
 }
 
+// connectionMonitor monitors connection health and triggers reconnection when needed
+func (w *OTLPWriter) connectionMonitor() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-ticker.C:
+			w.checkConnectionHealth()
+		case <-w.closeChan:
+			return
+		}
+	}
+}
+
 // Circuit breaker methods
 func (cb *circuitBreaker) canSend() bool {
 	cb.mu.Lock()
@@ -1224,8 +1494,9 @@ func (cb *circuitBreaker) recordSuccess() {
 	
 	if cb.state == circuitHalfOpen {
 		cb.successCount++
-		if cb.successCount >= 3 { // Need 3 consecutive successes to close
+		if cb.successCount >= 2 { // Need 2 consecutive successes to close
 			cb.state = circuitClosed
+			cb.failures = 0
 		}
 	}
 }
@@ -1240,10 +1511,11 @@ func (cb *circuitBreaker) recordFailure() {
 	if cb.state == circuitHalfOpen {
 		// Immediately open on failure in half-open state
 		cb.state = circuitOpen
-		cb.cooldownUntil = time.Now().Add(30 * time.Second)
-	} else if cb.failures >= 5 { // Open after 5 consecutive failures
+		cb.cooldownUntil = time.Now().Add(15 * time.Second) // Reduced cooldown
+		cb.successCount = 0
+	} else if cb.failures >= 3 { // Open after 3 consecutive failures (reduced from 5)
 		cb.state = circuitOpen
-		cb.cooldownUntil = time.Now().Add(30 * time.Second)
+		cb.cooldownUntil = time.Now().Add(15 * time.Second) // Reduced cooldown
 	}
 }
 
