@@ -204,17 +204,8 @@ func (w *OTLPWriter) Provision(ctx caddy.Context) error {
 		}
 	}
 
-	if w.Debug && w.logger != nil {
-		// Protect against potential logger panic during provision
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					// Silently ignore logger panics during provision
-				}
-			}()
-			w.logger.Info("OTLP writer debug mode enabled")
-		}()
-	}
+	// Note: Cannot use logger during Provision as we're part of the logging infrastructure
+	// being set up. Debug output will be shown when workers start.
 
 	// Set defaults from environment variables
 	if w.Endpoint == "" {
@@ -353,59 +344,16 @@ func (w *OTLPWriter) Provision(ctx caddy.Context) error {
 		return fmt.Errorf("unsupported protocol: %s (supported: grpc, http/protobuf)", w.Protocol)
 	}
 
-	// Only log if logger is fully initialized to avoid panic during config reloads
-	if w.logger != nil {
-		// Use defer to catch any potential panic from logger operations
-		defer func() {
-			if r := recover(); r != nil {
-				// Silently ignore logger panics during provision
-			}
-		}()
-		
-		w.logger.Info("OTLP log writer configured",
-			zap.String("endpoint", w.Endpoint),
-			zap.String("protocol", w.Protocol),
-			zap.String("service_name", w.ServiceName),
-		)
-	}
+	// Note: Cannot use logger during Provision as we're part of the logging infrastructure
+	// being set up. Configuration details will be logged when workers start.
 
 	// Start batch processor
-	if w.Debug && w.logger != nil {
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					// Silently ignore logger panics during provision
-				}
-			}()
-			w.logger.Debug("starting batch processor worker")
-		}()
-	}
 	go w.batchProcessor()
 
 	// Start retry worker
-	if w.Debug && w.logger != nil {
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					// Silently ignore logger panics during provision
-				}
-			}()
-			w.logger.Debug("starting retry worker")
-		}()
-	}
 	go w.retryWorker()
 	
 	// Start connection monitor
-	if w.Debug && w.logger != nil {
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					// Silently ignore logger panics during provision
-				}
-			}()
-			w.logger.Debug("starting connection monitor worker")
-		}()
-	}
 	go w.connectionMonitor()
 
 	return nil
@@ -502,12 +450,7 @@ func (w *OTLPWriter) Cleanup() error {
 func (w *OTLPWriter) initGRPCClient() error {
 	endpoint := w.normalizeEndpoint(w.Endpoint, false)
 	
-	if w.Debug {
-		w.logger.Info("initializing gRPC client", 
-			zap.String("endpoint", endpoint),
-			zap.Bool("insecure", w.Insecure),
-			zap.Duration("timeout", time.Duration(w.Timeout)))
-	}
+	// Debug logging moved to worker threads to avoid panic during provision
 	
 	opts := []grpc.DialOption{
 		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(64 * 1024 * 1024)),
@@ -552,10 +495,7 @@ func (w *OTLPWriter) initGRPCClient() error {
 	w.grpcConn = conn
 	w.grpcClient = collectorlogspb.NewLogsServiceClient(conn)
 	
-	if w.Debug {
-		w.logger.Info("gRPC client initialized successfully", 
-			zap.String("endpoint", endpoint))
-	}
+	// Success logging moved to worker threads to avoid panic during provision
 	
 	return nil
 }
@@ -574,12 +514,7 @@ func (w *OTLPWriter) grpcHeadersInterceptor() grpc.UnaryClientInterceptor {
 func (w *OTLPWriter) initHTTPClient() error {
 	w.httpEndpoint = w.normalizeEndpoint(w.Endpoint, true)
 	
-	if w.Debug {
-		w.logger.Info("initializing HTTP client", 
-			zap.String("endpoint", w.httpEndpoint),
-			zap.Bool("insecure", w.Insecure),
-			zap.Duration("timeout", time.Duration(w.Timeout)))
-	}
+	// Debug logging moved to worker threads to avoid panic during provision
 	
 	transport := &http.Transport{
 		TLSClientConfig: &tls.Config{
@@ -609,10 +544,7 @@ func (w *OTLPWriter) initHTTPClient() error {
 		Timeout:   time.Duration(w.Timeout),
 	}
 
-	if w.Debug {
-		w.logger.Info("HTTP client initialized successfully", 
-			zap.String("endpoint", w.httpEndpoint))
-	}
+	// Success logging moved to worker threads to avoid panic during provision
 
 	return nil
 }
@@ -694,6 +626,13 @@ func (w *OTLPWriter) normalizeEndpoint(endpoint string, isHTTP bool) string {
 
 // batchProcessor processes log batches.
 func (w *OTLPWriter) batchProcessor() {
+	// Log configuration details on first run (safe here as logger is now initialized)
+	w.logger.Info("OTLP log writer configured",
+		zap.String("endpoint", w.Endpoint),
+		zap.String("protocol", w.Protocol),
+		zap.String("service_name", w.ServiceName),
+	)
+	
 	if w.Debug {
 		w.logger.Debug("batch processor worker started", 
 			zap.Duration("batch_timeout", time.Duration(w.BatchTimeout)))
