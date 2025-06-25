@@ -444,14 +444,39 @@ func (w *OTLPWriter) normalizeEndpoint(endpoint string, isHTTP bool) string {
 		return "localhost:4317"
 	}
 
-	if isHTTP {
-		// Ensure proper URL format
-		if !strings.Contains(endpoint, "://") {
-			if w.Insecure {
-				endpoint = "http://" + endpoint
+	// Parse the URL to check for scheme
+	if strings.Contains(endpoint, "://") {
+		u, err := url.Parse(endpoint)
+		if err == nil {
+			if isHTTP {
+				// For HTTP, ensure path includes /v1/logs
+				if !strings.HasSuffix(u.Path, "/v1/logs") {
+					if !strings.HasSuffix(u.Path, "/") {
+						u.Path += "/"
+					}
+					u.Path += "v1/logs"
+				}
+				return u.String()
 			} else {
-				endpoint = "https://" + endpoint
+				// For gRPC, extract host:port from URL
+				host := u.Host
+				if host == "" {
+					// Handle case where scheme is present but host parsing failed
+					// This might happen with malformed URLs
+					return endpoint
+				}
+				return host
 			}
+		}
+	}
+
+	// No scheme present, handle as before
+	if isHTTP {
+		// Add scheme based on insecure setting
+		if w.Insecure {
+			endpoint = "http://" + endpoint
+		} else {
+			endpoint = "https://" + endpoint
 		}
 		
 		// Ensure path includes /v1/logs
