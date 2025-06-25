@@ -34,11 +34,14 @@ func (m *mockOTLPServer) Export(ctx context.Context, req *collectorlogspb.Export
 	defer m.mu.Unlock()
 	
 	m.callCount++
-	m.receivedRequests = append(m.receivedRequests, req)
 	
+	// Check if we should return an error before adding to received requests
 	if m.callCount <= len(m.errorsToReturn) && m.errorsToReturn[m.callCount-1] != nil {
 		return nil, m.errorsToReturn[m.callCount-1]
 	}
+	
+	// Only add to received requests if no error
+	m.receivedRequests = append(m.receivedRequests, req)
 	
 	return &collectorlogspb.ExportLogsServiceResponse{
 		PartialSuccess: &collectorlogspb.ExportLogsPartialSuccess{},
@@ -433,11 +436,17 @@ func TestOTLPWriter_Integration_ErrorHandling(t *testing.T) {
 	mock, endpoint, cleanup := startMockGRPCServer(t)
 	defer cleanup()
 	
-	// Configure mock to return errors
+	// Configure mock to return errors BEFORE creating the OTLP writer
+	// gRPC has built-in retry with maxAttempts: 3, so we need to fail more than that
+	mock.mu.Lock()
 	mock.errorsToReturn = []error{
 		status.Error(codes.Unavailable, "service unavailable"),
-		nil, // Second call succeeds
+		status.Error(codes.Unavailable, "service unavailable"),
+		status.Error(codes.Unavailable, "service unavailable"),
+		status.Error(codes.Unavailable, "service unavailable"), // This will exceed gRPC retry limit
+		nil, // Fifth call succeeds
 	}
+	mock.mu.Unlock()
 	
 	// Give server time to start
 	time.Sleep(100 * time.Millisecond)
@@ -489,6 +498,7 @@ func TestOTLPWriter_Integration_ErrorHandling(t *testing.T) {
 	}
 	
 	// Verify error was reported
+	t.Logf("Current failedBatches: %d", w.failedBatches)
 	if w.failedBatches == 0 {
 		t.Error("Expected failedBatches counter to be incremented")
 	}

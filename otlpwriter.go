@@ -79,6 +79,10 @@ type OTLPWriter struct {
 	// RetryDelay is the initial delay between retry attempts.
 	RetryDelay caddy.Duration `json:"retry_delay,omitempty"`
 
+	// Debug enables verbose debug logging for troubleshooting.
+	// Can also be enabled via CADDY_OTLP_DEBUG environment variable.
+	Debug bool `json:"debug,omitempty"`
+
 	logger       *zap.Logger
 	resource     *resourcepb.Resource
 	grpcConn     *grpc.ClientConn
@@ -128,6 +132,20 @@ const (
 	circuitHalfOpen
 )
 
+// getCircuitBreakerStateName returns a human-readable name for the circuit breaker state
+func (w *OTLPWriter) getCircuitBreakerStateName(state int) string {
+	switch state {
+	case circuitClosed:
+		return "closed"
+	case circuitOpen:
+		return "open"
+	case circuitHalfOpen:
+		return "half-open"
+	default:
+		return "unknown"
+	}
+}
+
 // drainOldestFromRetryQueue attempts to remove the oldest item from retry queue
 func (w *OTLPWriter) drainOldestFromRetryQueue() bool {
 	select {
@@ -142,7 +160,14 @@ func (w *OTLPWriter) drainOldestFromRetryQueue() bool {
 func (w *OTLPWriter) checkConnectionHealth() {
 	w.mu.Lock()
 	timeSinceLastSuccess := time.Since(w.lastSuccessfulSend)
+	healthy := w.connectionHealthy
 	w.mu.Unlock()
+	
+	if w.Debug {
+		w.logger.Debug("performing connection health check", 
+			zap.Duration("time_since_last_success", timeSinceLastSuccess),
+			zap.Bool("currently_healthy", healthy))
+	}
 	
 	// If we haven't sent successfully in a while, try to reconnect
 	if timeSinceLastSuccess > 2*time.Minute {
@@ -150,6 +175,8 @@ func (w *OTLPWriter) checkConnectionHealth() {
 			zap.Duration("time_since_last_success", timeSinceLastSuccess))
 		if err := w.reconnect(); err != nil {
 			w.logger.Error("health check reconnection failed", zap.Error(err))
+		} else if w.Debug {
+			w.logger.Debug("health check reconnection successful")
 		}
 	}
 }
@@ -166,6 +193,17 @@ func (*OTLPWriter) CaddyModule() caddy.ModuleInfo {
 func (w *OTLPWriter) Provision(ctx caddy.Context) error {
 	w.logger = ctx.Logger(w)
 	w.closeChan = make(chan struct{})
+
+	// Check for debug flag from environment variable
+	if !w.Debug {
+		if debug := os.Getenv("CADDY_OTLP_DEBUG"); debug == "true" || debug == "1" {
+			w.Debug = true
+		}
+	}
+
+	if w.Debug {
+		w.logger.Info("OTLP writer debug mode enabled")
+	}
 
 	// Set defaults from environment variables
 	if w.Endpoint == "" {
@@ -311,12 +349,21 @@ func (w *OTLPWriter) Provision(ctx caddy.Context) error {
 	)
 
 	// Start batch processor
+	if w.Debug {
+		w.logger.Debug("starting batch processor worker")
+	}
 	go w.batchProcessor()
 
 	// Start retry worker
+	if w.Debug {
+		w.logger.Debug("starting retry worker")
+	}
 	go w.retryWorker()
 	
 	// Start connection monitor
+	if w.Debug {
+		w.logger.Debug("starting connection monitor worker")
+	}
 	go w.connectionMonitor()
 
 	return nil
@@ -413,17 +460,21 @@ func (w *OTLPWriter) Cleanup() error {
 func (w *OTLPWriter) initGRPCClient() error {
 	endpoint := w.normalizeEndpoint(w.Endpoint, false)
 	
+	if w.Debug {
+		w.logger.Info("initializing gRPC client", 
+			zap.String("endpoint", endpoint),
+			zap.Bool("insecure", w.Insecure),
+			zap.Duration("timeout", time.Duration(w.Timeout)))
+	}
+	
 	opts := []grpc.DialOption{
 		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(64 * 1024 * 1024)),
 		// Add keepalive parameters to detect stale connections
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
-			Time:                10 * time.Second, // Send pings every 10 seconds (reduced from 20)
-			Timeout:             5 * time.Second,  // Wait 5 seconds for ping ack (reduced from 10)
-			PermitWithoutStream: true,             // Send pings even without active streams
+			Time:                30 * time.Second, // Send pings every 30 seconds
+			Timeout:             10 * time.Second, // Wait 10 seconds for ping ack
+			PermitWithoutStream: false,            // Only send pings when there are active streams
 		}),
-		// Add connection timeout
-		grpc.WithBlock(),
-		grpc.WithTimeout(30 * time.Second),
 		// Enable retries for transient failures
 		grpc.WithDefaultServiceConfig(`{
 			"methodConfig": [{
@@ -450,11 +501,8 @@ func (w *OTLPWriter) initGRPCClient() error {
 		opts = append(opts, grpc.WithUnaryInterceptor(w.grpcHeadersInterceptor()))
 	}
 
-	// Create connection with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	
-	conn, err := grpc.DialContext(ctx, endpoint, opts...)
+	// Create connection using non-blocking approach
+	conn, err := grpc.Dial(endpoint, opts...)
 	if err != nil {
 		return fmt.Errorf("failed to create gRPC connection to %s: %w", endpoint, err)
 	}
@@ -462,17 +510,9 @@ func (w *OTLPWriter) initGRPCClient() error {
 	w.grpcConn = conn
 	w.grpcClient = collectorlogspb.NewLogsServiceClient(conn)
 	
-	// Test the connection
-	testCtx, testCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer testCancel()
-	
-	_, testErr := w.grpcClient.Export(testCtx, &collectorlogspb.ExportLogsServiceRequest{
-		ResourceLogs: []*logspb.ResourceLogs{},
-	})
-	
-	// Ignore NOT_FOUND errors as some servers don't handle empty requests well
-	if testErr != nil && !strings.Contains(testErr.Error(), "NOT_FOUND") {
-		w.logger.Warn("initial gRPC connection test failed", zap.Error(testErr))
+	if w.Debug {
+		w.logger.Info("gRPC client initialized successfully", 
+			zap.String("endpoint", endpoint))
 	}
 	
 	return nil
@@ -491,6 +531,13 @@ func (w *OTLPWriter) grpcHeadersInterceptor() grpc.UnaryClientInterceptor {
 // initHTTPClient initializes the HTTP client.
 func (w *OTLPWriter) initHTTPClient() error {
 	w.httpEndpoint = w.normalizeEndpoint(w.Endpoint, true)
+	
+	if w.Debug {
+		w.logger.Info("initializing HTTP client", 
+			zap.String("endpoint", w.httpEndpoint),
+			zap.Bool("insecure", w.Insecure),
+			zap.Duration("timeout", time.Duration(w.Timeout)))
+	}
 	
 	transport := &http.Transport{
 		TLSClientConfig: &tls.Config{
@@ -518,6 +565,11 @@ func (w *OTLPWriter) initHTTPClient() error {
 	w.httpClient = &http.Client{
 		Transport: transport,
 		Timeout:   time.Duration(w.Timeout),
+	}
+
+	if w.Debug {
+		w.logger.Info("HTTP client initialized successfully", 
+			zap.String("endpoint", w.httpEndpoint))
 	}
 
 	return nil
@@ -600,12 +652,19 @@ func (w *OTLPWriter) normalizeEndpoint(endpoint string, isHTTP bool) string {
 
 // batchProcessor processes log batches.
 func (w *OTLPWriter) batchProcessor() {
+	if w.Debug {
+		w.logger.Debug("batch processor worker started", 
+			zap.Duration("batch_timeout", time.Duration(w.BatchTimeout)))
+	}
 	ticker := time.NewTicker(time.Duration(w.BatchTimeout))
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-w.closeChan:
+			if w.Debug {
+				w.logger.Debug("batch processor worker shutting down")
+			}
 			return
 		case <-ticker.C:
 			w.mu.Lock()
@@ -635,8 +694,18 @@ func (w *OTLPWriter) addLog(record *logspb.LogRecord) {
 	defer w.mu.Unlock()
 
 	w.logsBatch = append(w.logsBatch, record)
+	
+	if w.Debug {
+		w.logger.Debug("added log to batch", 
+			zap.Int("current_batch_size", len(w.logsBatch)),
+			zap.Int("max_batch_size", w.BatchSize))
+	}
 
 	if len(w.logsBatch) >= w.BatchSize {
+		if w.Debug {
+			w.logger.Debug("batch size threshold reached, attempting to send", 
+				zap.Int("batch_size", len(w.logsBatch)))
+		}
 		// Check if circuit breaker allows sending
 		if w.circuitBreaker.canSend() {
 			logCount := len(w.logsBatch)
@@ -706,7 +775,16 @@ func (w *OTLPWriter) reportBatchError(err error, logCount int, location string) 
 // sendBatch sends the current batch of logs.
 func (w *OTLPWriter) sendBatch() error {
 	if len(w.logsBatch) == 0 {
+		if w.Debug {
+			w.logger.Debug("sendBatch called with empty batch")
+		}
 		return nil
+	}
+	
+	if w.Debug {
+		w.logger.Debug("sending batch", 
+			zap.Int("logs_count", len(w.logsBatch)),
+			zap.String("protocol", w.Protocol))
 	}
 
 	// Make a copy of the batch for sending
@@ -714,11 +792,14 @@ func (w *OTLPWriter) sendBatch() error {
 	copy(batchCopy, w.logsBatch)
 	
 	// Try to send the batch first before clearing
-	err := w.sendBatchWithRetry(batchCopy)
+	err := w.sendBatchWithRetryUnsafe(batchCopy)
 	
 	// Only clear batch if send was successful
 	if err == nil {
 		w.logsBatch = w.logsBatch[:0]
+		if w.Debug {
+			w.logger.Debug("batch sent successfully, batch cleared")
+		}
 		return nil
 	}
 	
@@ -743,6 +824,12 @@ func (w *OTLPWriter) sendBatch() error {
 		w.logger.Warn("queued failed batch for retry",
 			zap.Int("logs", len(batchCopy)),
 			zap.Error(err))
+	case <-w.closeChan:
+		// Channel is being closed, clear batch and return
+		w.logsBatch = w.logsBatch[:0]
+		w.logger.Debug("retry queue closed during send, dropping batch",
+			zap.Int("logs", len(batchCopy)))
+		return err
 	default:
 		// Retry queue is full - try to send oldest items first
 		if w.drainOldestFromRetryQueue() {
@@ -756,6 +843,12 @@ func (w *OTLPWriter) sendBatch() error {
 				w.logsBatch = w.logsBatch[:0]
 				w.logger.Warn("queued failed batch for retry after draining old items",
 					zap.Int("logs", len(batchCopy)))
+			case <-w.closeChan:
+				// Channel is being closed, clear batch and return
+				w.logsBatch = w.logsBatch[:0]
+				w.logger.Debug("retry queue closed during send, dropping batch",
+					zap.Int("logs", len(batchCopy)))
+				return err
 			default:
 				// Still full - have to drop
 				w.logsBatch = w.logsBatch[:0]
@@ -1180,7 +1273,15 @@ func (w *OTLPWriter) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 
 // retryWorker processes failed batches from the retry queue
 func (w *OTLPWriter) retryWorker() {
-	defer close(w.retryWorkerDone)
+	if w.Debug {
+		w.logger.Debug("retry worker started")
+	}
+	defer func() {
+		if w.Debug {
+			w.logger.Debug("retry worker shutting down")
+		}
+		close(w.retryWorkerDone)
+	}()
 	
 	// Create a timer for periodic health checks
 	healthCheckTicker := time.NewTicker(30 * time.Second)
@@ -1219,6 +1320,9 @@ func (w *OTLPWriter) retryWorker() {
 				case w.retryQueue <- item:
 					w.logger.Debug("requeued item due to circuit breaker",
 						zap.Int("logs", len(item.logs)))
+				case <-w.closeChan:
+					// Channel is being closed, exit
+					return
 				default:
 					w.logger.Warn("retry queue full while circuit breaker open",
 						zap.Int("logs", len(item.logs)))
@@ -1251,6 +1355,9 @@ func (w *OTLPWriter) retryWorker() {
 							zap.Duration("next_delay", delay),
 							zap.Int("logs", len(item.logs)),
 							zap.Error(err))
+					case <-w.closeChan:
+						// Channel is being closed, exit
+						return
 					default:
 						w.logger.Error("retry queue full, dropping batch",
 							zap.Int("logs", len(item.logs)))
@@ -1284,6 +1391,14 @@ func (w *OTLPWriter) sendBatchWithRetry(logs []*logspb.LogRecord) error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(w.Timeout))
 	defer cancel()
 	return w.sendBatchWithRetryContext(ctx, logs)
+}
+
+// sendBatchWithRetryUnsafe sends a batch with circuit breaker and connection recovery without acquiring mutex
+// This should only be called when the mutex is already held
+func (w *OTLPWriter) sendBatchWithRetryUnsafe(logs []*logspb.LogRecord) error {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(w.Timeout))
+	defer cancel()
+	return w.sendBatchWithRetryContextUnsafe(ctx, logs)
 }
 
 // sendBatchWithRetryContext sends a batch with circuit breaker, connection recovery, and context support
@@ -1321,24 +1436,105 @@ func (w *OTLPWriter) sendBatchWithRetryContext(ctx context.Context, logs []*logs
 
 	// Update circuit breaker and connection health
 	if err != nil {
+		// Increment failed batch counter for any send failure
+		w.failedBatches++
+		oldState := w.circuitBreaker.state
 		w.circuitBreaker.recordFailure()
-		w.mu.Lock()
-		w.connectionHealthy = false
-		w.mu.Unlock()
+		if w.Debug && oldState != w.circuitBreaker.state {
+			w.logger.Debug("circuit breaker state changed due to failure", 
+				zap.String("old_state", w.getCircuitBreakerStateName(oldState)),
+				zap.String("new_state", w.getCircuitBreakerStateName(w.circuitBreaker.state)),
+				zap.Int("failures", w.circuitBreaker.failures))
+		}
+		w.updateConnectionHealth(false)
 		
 		// Check if we need to reconnect
 		if w.isConnectionError(err) {
 			w.logger.Warn("detected connection error, attempting to reconnect", zap.Error(err))
-			if reconnectErr := w.reconnect(); reconnectErr != nil {
+			if reconnectErr := w.reconnectSafe(); reconnectErr != nil {
 				w.logger.Error("failed to reconnect", zap.Error(reconnectErr))
 			}
 		}
 	} else {
+		oldState := w.circuitBreaker.state
 		w.circuitBreaker.recordSuccess()
-		w.mu.Lock()
-		w.lastSuccessfulSend = time.Now()
-		w.connectionHealthy = true
-		w.mu.Unlock()
+		if w.Debug && oldState != w.circuitBreaker.state {
+			w.logger.Debug("circuit breaker state changed due to success", 
+				zap.String("old_state", w.getCircuitBreakerStateName(oldState)),
+				zap.String("new_state", w.getCircuitBreakerStateName(w.circuitBreaker.state)),
+				zap.Int("success_count", w.circuitBreaker.successCount))
+		}
+		w.updateConnectionHealth(true)
+	}
+
+	return err
+}
+
+// sendBatchWithRetryContextUnsafe sends a batch with circuit breaker, connection recovery, and context support without acquiring mutex
+// This should only be called when the mutex is already held
+func (w *OTLPWriter) sendBatchWithRetryContextUnsafe(ctx context.Context, logs []*logspb.LogRecord) error {
+	// Check circuit breaker
+	if !w.circuitBreaker.canSend() {
+		return fmt.Errorf("circuit breaker is open")
+	}
+
+	// Create request
+	req := &collectorlogspb.ExportLogsServiceRequest{
+		ResourceLogs: []*logspb.ResourceLogs{
+			{
+				Resource: w.resource,
+				ScopeLogs: []*logspb.ScopeLogs{
+					{
+						Scope: &commonpb.InstrumentationScope{
+							Name:    "caddy",
+							Version: "2.0.0",
+						},
+						LogRecords: logs,
+					},
+				},
+			},
+		},
+	}
+
+	var err error
+	// Send based on protocol
+	if w.grpcClient != nil {
+		err = w.sendViaGRPCContext(ctx, req)
+	} else if w.httpClient != nil {
+		err = w.sendViaHTTPContext(ctx, req)
+	}
+
+	// Update circuit breaker and connection health (using unsafe version since mutex is held)
+	if err != nil {
+		// Increment failed batch counter for any send failure
+		w.failedBatches++
+		oldState := w.circuitBreaker.state
+		w.circuitBreaker.recordFailure()
+		if w.Debug && oldState != w.circuitBreaker.state {
+			w.logger.Debug("circuit breaker state changed due to failure (unsafe)", 
+				zap.String("old_state", w.getCircuitBreakerStateName(oldState)),
+				zap.String("new_state", w.getCircuitBreakerStateName(w.circuitBreaker.state)),
+				zap.Int("failures", w.circuitBreaker.failures))
+		}
+		w.updateConnectionHealthUnsafe(false)
+		
+		// Check if we need to reconnect
+		if w.isConnectionError(err) {
+			w.logger.Warn("detected connection error, attempting to reconnect", zap.Error(err))
+			if reconnectErr := w.reconnectSafe(); reconnectErr != nil {
+				w.logger.Error("failed to reconnect", zap.Error(reconnectErr))
+			}
+		}
+	} else {
+		oldState := w.circuitBreaker.state
+		w.circuitBreaker.recordSuccess()
+		if w.Debug && oldState != w.circuitBreaker.state {
+			w.logger.Debug("circuit breaker state changed due to success (unsafe)", 
+				zap.String("old_state", w.getCircuitBreakerStateName(oldState)),
+				zap.String("new_state", w.getCircuitBreakerStateName(w.circuitBreaker.state)),
+				zap.Int("success_count", w.circuitBreaker.successCount))
+		}
+		w.updateConnectionHealthUnsafe(true)
 	}
 
 	return err
@@ -1426,11 +1622,63 @@ func (w *OTLPWriter) isConnectionError(err error) bool {
 	return false
 }
 
+// updateConnectionHealth safely updates connection health status
+func (w *OTLPWriter) updateConnectionHealth(healthy bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	
+	w.updateConnectionHealthUnsafe(healthy)
+}
+
+// updateConnectionHealthUnsafe updates connection health status without acquiring mutex
+// This should only be called when the mutex is already held
+func (w *OTLPWriter) updateConnectionHealthUnsafe(healthy bool) {
+	w.connectionHealthy = healthy
+	if healthy {
+		w.lastSuccessfulSend = time.Now()
+	}
+}
+
 // reconnect attempts to reestablish the connection
 func (w *OTLPWriter) reconnect() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	if w.Debug {
+		w.logger.Info("attempting connection reconnect", 
+			zap.String("protocol", w.Protocol),
+			zap.String("endpoint", w.Endpoint))
+	}
+
+	// Close existing connections
+	if w.grpcConn != nil {
+		w.grpcConn.Close()
+		w.grpcConn = nil
+		w.grpcClient = nil
+	}
+
+	// Reinitialize based on protocol
+	var err error
+	switch strings.ToLower(w.Protocol) {
+	case "grpc":
+		err = w.initGRPCClient()
+	case "http/protobuf", "http":
+		err = w.initHTTPClient()
+	default:
+		err = fmt.Errorf("unsupported protocol for reconnection: %s", w.Protocol)
+	}
+
+	if err != nil && w.Debug {
+		w.logger.Error("connection reconnect failed", zap.Error(err))
+	} else if w.Debug {
+		w.logger.Info("connection reconnect successful")
+	}
+
+	return err
+}
+
+// reconnectSafe attempts to reestablish the connection without acquiring mutex
+func (w *OTLPWriter) reconnectSafe() error {
 	// Close existing connections
 	if w.grpcConn != nil {
 		w.grpcConn.Close()
@@ -1451,6 +1699,9 @@ func (w *OTLPWriter) reconnect() error {
 
 // connectionMonitor monitors connection health and triggers reconnection when needed
 func (w *OTLPWriter) connectionMonitor() {
+	if w.Debug {
+		w.logger.Debug("connection monitor worker started")
+	}
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	
@@ -1459,6 +1710,9 @@ func (w *OTLPWriter) connectionMonitor() {
 		case <-ticker.C:
 			w.checkConnectionHealth()
 		case <-w.closeChan:
+			if w.Debug {
+				w.logger.Debug("connection monitor worker shutting down")
+			}
 			return
 		}
 	}
@@ -1476,6 +1730,8 @@ func (cb *circuitBreaker) canSend() bool {
 		if now.After(cb.cooldownUntil) {
 			cb.state = circuitHalfOpen
 			cb.successCount = 0
+			// Note: Debug logging would require access to logger, which is not available in this context
+			// This will be logged at the caller level
 			return true
 		}
 		return false
@@ -1495,8 +1751,12 @@ func (cb *circuitBreaker) recordSuccess() {
 	if cb.state == circuitHalfOpen {
 		cb.successCount++
 		if cb.successCount >= 2 { // Need 2 consecutive successes to close
+			oldState := cb.state
 			cb.state = circuitClosed
 			cb.failures = 0
+			// Note: Debug logging would require access to logger, which is not available in this context
+			// This will be logged at the caller level
+			_ = oldState // Avoid unused variable warning
 		}
 	}
 }
@@ -1513,9 +1773,13 @@ func (cb *circuitBreaker) recordFailure() {
 		cb.state = circuitOpen
 		cb.cooldownUntil = time.Now().Add(15 * time.Second) // Reduced cooldown
 		cb.successCount = 0
+		// Note: Debug logging would require access to logger, which is not available in this context
+		// This will be logged at the caller level
 	} else if cb.failures >= 3 { // Open after 3 consecutive failures (reduced from 5)
 		cb.state = circuitOpen
 		cb.cooldownUntil = time.Now().Add(15 * time.Second) // Reduced cooldown
+		// Note: Debug logging would require access to logger, which is not available in this context
+		// This will be logged at the caller level
 	}
 }
 
