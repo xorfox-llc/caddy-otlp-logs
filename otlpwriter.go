@@ -191,7 +191,7 @@ func (w *OTLPWriter) checkConnectionHealth() {
 	if timeSinceLastSuccess > 2*time.Minute {
 		w.warnf("no successful sends recently, attempting reconnection: time_since_last_success=%v", timeSinceLastSuccess)
 		if err := w.reconnect(); err != nil {
-			w.logger.Error("health check reconnection failed", zap.Error(err))
+			w.warnf("health check reconnection failed: %v", err)
 		} else {
 			w.debugf("health check reconnection successful")
 		}
@@ -475,13 +475,10 @@ func (w *OTLPWriter) Cleanup() error {
 			select {
 			case item := <-w.retryQueue:
 				if err := w.sendBatchWithRetryContext(ctx, item.logs); err != nil {
-					w.logger.Error("failed to send batch during cleanup",
-						zap.Error(err),
-						zap.Int("logs", len(item.logs)))
+					w.warnf("failed to send batch during cleanup: logs=%d, error=%v", len(item.logs), err)
 				}
 			case <-ctx.Done():
-				w.logger.Warn("cleanup timeout reached, some logs may be lost",
-					zap.Int("remaining", len(w.retryQueue)))
+				w.warnf("cleanup timeout reached, some logs may be lost: remaining=%d", len(w.retryQueue))
 				break
 			}
 		}
@@ -688,12 +685,9 @@ func (w *OTLPWriter) normalizeEndpoint(endpoint string, isHTTP bool) string {
 
 // batchProcessor processes log batches.
 func (w *OTLPWriter) batchProcessor() {
-	// Log configuration details on first run (safe here as logger is now initialized)
-	w.logger.Info("OTLP log writer configured",
-		zap.String("endpoint", w.Endpoint),
-		zap.String("protocol", w.Protocol),
-		zap.String("service_name", w.ServiceName),
-	)
+	// Log configuration details on first run using stderr to avoid initialization issues
+	w.infof("OTLP log writer configured: endpoint=%s, protocol=%s, service_name=%s", 
+		w.Endpoint, w.Protocol, w.ServiceName)
 	
 	w.debugf("batch processor worker started: batch_timeout=%v", time.Duration(w.BatchTimeout))
 	ticker := time.NewTicker(time.Duration(w.BatchTimeout))
@@ -865,13 +859,11 @@ func (w *OTLPWriter) sendBatch() error {
 				nextRetry: time.Now().Add(time.Duration(w.RetryDelay)),
 			}:
 				w.logsBatch = w.logsBatch[:0]
-				w.logger.Warn("queued failed batch for retry after draining old items",
-					zap.Int("logs", len(batchCopy)))
+				w.warnf("queued failed batch for retry after draining old items: logs=%d", len(batchCopy))
 			case <-w.closeChan:
 				// Channel is being closed, clear batch and return
 				w.logsBatch = w.logsBatch[:0]
-				w.logger.Debug("retry queue closed during send, dropping batch",
-					zap.Int("logs", len(batchCopy)))
+				w.debugf("retry queue closed during send, dropping batch: logs=%d", len(batchCopy))
 				return err
 			default:
 				// Still full - have to drop
@@ -1297,16 +1289,12 @@ func (w *OTLPWriter) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 
 // retryWorker processes failed batches from the retry queue
 func (w *OTLPWriter) retryWorker() {
-	if w.Debug {
-		w.logger.Debug("retry worker started")
-	}
+	w.debugf("retry worker started")
 	defer func() {
 		if r := recover(); r != nil {
-			w.logger.Error("retry worker panic recovered", zap.Any("panic", r))
+			w.warnf("retry worker panic recovered: %v", r)
 		}
-		if w.Debug {
-			w.logger.Debug("retry worker shutting down")
-		}
+		w.debugf("retry worker shutting down")
 		close(w.retryWorkerDone)
 	}()
 	
@@ -1345,14 +1333,12 @@ func (w *OTLPWriter) retryWorker() {
 				item.nextRetry = time.Now().Add(10 * time.Second)
 				select {
 				case w.retryQueue <- item:
-					w.logger.Debug("requeued item due to circuit breaker",
-						zap.Int("logs", len(item.logs)))
+					w.debugf("requeued item due to circuit breaker: logs=%d", len(item.logs))
 				case <-w.closeChan:
 					// Channel is being closed, exit
 					return
 				default:
-					w.logger.Warn("retry queue full while circuit breaker open",
-						zap.Int("logs", len(item.logs)))
+					w.warnf("retry queue full while circuit breaker open: logs=%d", len(item.logs))
 				}
 				continue
 			}
@@ -1377,11 +1363,8 @@ func (w *OTLPWriter) retryWorker() {
 					// Try to requeue - check if queue is still open
 					select {
 					case w.retryQueue <- item:
-						w.logger.Warn("requeued failed batch for retry",
-							zap.Int("attempt", item.attempts),
-							zap.Duration("next_delay", delay),
-							zap.Int("logs", len(item.logs)),
-							zap.Error(err))
+						w.warnf("requeued failed batch for retry: attempt=%d, next_delay=%v, logs=%d, error=%v", 
+							item.attempts, delay, len(item.logs), err)
 					case <-w.closeChan:
 						// Channel is being closed, exit
 						return
@@ -1398,9 +1381,8 @@ func (w *OTLPWriter) retryWorker() {
 					w.reportBatchError(fmt.Errorf("max retries exceeded: %w", err), len(item.logs), "retryWorker")
 				}
 			} else {
-				w.logger.Info("successfully sent retried batch",
-					zap.Int("logs", len(item.logs)),
-					zap.Int("attempts", item.attempts))
+				w.infof("successfully sent retried batch: logs=%d, attempts=%d", 
+					len(item.logs), item.attempts)
 			}
 			
 		case <-healthCheckTicker.C:
@@ -1468,28 +1450,28 @@ func (w *OTLPWriter) sendBatchWithRetryContext(ctx context.Context, logs []*logs
 		oldState := w.circuitBreaker.state
 		w.circuitBreaker.recordFailure()
 		if w.Debug && oldState != w.circuitBreaker.state {
-			w.logger.Debug("circuit breaker state changed due to failure", 
-				zap.String("old_state", w.getCircuitBreakerStateName(oldState)),
-				zap.String("new_state", w.getCircuitBreakerStateName(w.circuitBreaker.state)),
-				zap.Int("failures", w.circuitBreaker.failures))
+			w.debugf("circuit breaker state changed due to failure: old_state=%s, new_state=%s, failures=%d", 
+				w.getCircuitBreakerStateName(oldState),
+				w.getCircuitBreakerStateName(w.circuitBreaker.state),
+				w.circuitBreaker.failures)
 		}
 		w.updateConnectionHealth(false)
 		
 		// Check if we need to reconnect
 		if w.isConnectionError(err) {
-			w.logger.Warn("detected connection error, attempting to reconnect", zap.Error(err))
+			w.warnf("detected connection error, attempting to reconnect: %v", err)
 			if reconnectErr := w.reconnectSafe(); reconnectErr != nil {
-				w.logger.Error("failed to reconnect", zap.Error(reconnectErr))
+				w.warnf("failed to reconnect: %v", reconnectErr)
 			}
 		}
 	} else {
 		oldState := w.circuitBreaker.state
 		w.circuitBreaker.recordSuccess()
 		if w.Debug && oldState != w.circuitBreaker.state {
-			w.logger.Debug("circuit breaker state changed due to success", 
-				zap.String("old_state", w.getCircuitBreakerStateName(oldState)),
-				zap.String("new_state", w.getCircuitBreakerStateName(w.circuitBreaker.state)),
-				zap.Int("success_count", w.circuitBreaker.successCount))
+			w.debugf("circuit breaker state changed due to success: old_state=%s, new_state=%s, success_count=%d", 
+				w.getCircuitBreakerStateName(oldState),
+				w.getCircuitBreakerStateName(w.circuitBreaker.state),
+				w.circuitBreaker.successCount)
 		}
 		w.updateConnectionHealth(true)
 	}
@@ -1538,28 +1520,28 @@ func (w *OTLPWriter) sendBatchWithRetryContextUnsafe(ctx context.Context, logs [
 		oldState := w.circuitBreaker.state
 		w.circuitBreaker.recordFailure()
 		if w.Debug && oldState != w.circuitBreaker.state {
-			w.logger.Debug("circuit breaker state changed due to failure (unsafe)", 
-				zap.String("old_state", w.getCircuitBreakerStateName(oldState)),
-				zap.String("new_state", w.getCircuitBreakerStateName(w.circuitBreaker.state)),
-				zap.Int("failures", w.circuitBreaker.failures))
+			w.debugf("circuit breaker state changed due to failure (unsafe): old_state=%s, new_state=%s, failures=%d", 
+				w.getCircuitBreakerStateName(oldState),
+				w.getCircuitBreakerStateName(w.circuitBreaker.state),
+				w.circuitBreaker.failures)
 		}
 		w.updateConnectionHealthUnsafe(false)
 		
 		// Check if we need to reconnect
 		if w.isConnectionError(err) {
-			w.logger.Warn("detected connection error, attempting to reconnect", zap.Error(err))
+			w.warnf("detected connection error, attempting to reconnect: %v", err)
 			if reconnectErr := w.reconnectSafe(); reconnectErr != nil {
-				w.logger.Error("failed to reconnect", zap.Error(reconnectErr))
+				w.warnf("failed to reconnect: %v", reconnectErr)
 			}
 		}
 	} else {
 		oldState := w.circuitBreaker.state
 		w.circuitBreaker.recordSuccess()
 		if w.Debug && oldState != w.circuitBreaker.state {
-			w.logger.Debug("circuit breaker state changed due to success (unsafe)", 
-				zap.String("old_state", w.getCircuitBreakerStateName(oldState)),
-				zap.String("new_state", w.getCircuitBreakerStateName(w.circuitBreaker.state)),
-				zap.Int("success_count", w.circuitBreaker.successCount))
+			w.debugf("circuit breaker state changed due to success (unsafe): old_state=%s, new_state=%s, success_count=%d", 
+				w.getCircuitBreakerStateName(oldState),
+				w.getCircuitBreakerStateName(w.circuitBreaker.state),
+				w.circuitBreaker.successCount)
 		}
 		w.updateConnectionHealthUnsafe(true)
 	}
@@ -1671,11 +1653,8 @@ func (w *OTLPWriter) reconnect() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	if w.Debug {
-		w.logger.Info("attempting connection reconnect", 
-			zap.String("protocol", w.Protocol),
-			zap.String("endpoint", w.Endpoint))
-	}
+	w.infof("attempting connection reconnect: protocol=%s, endpoint=%s", 
+		w.Protocol, w.Endpoint)
 
 	// Close existing connections
 	if w.grpcConn != nil {
@@ -1696,9 +1675,9 @@ func (w *OTLPWriter) reconnect() error {
 	}
 
 	if err != nil && w.Debug {
-		w.logger.Error("connection reconnect failed", zap.Error(err))
+		w.debugf("connection reconnect failed: %v", err)
 	} else if w.Debug {
-		w.logger.Info("connection reconnect successful")
+		w.infof("connection reconnect successful")
 	}
 
 	return err
@@ -1726,9 +1705,7 @@ func (w *OTLPWriter) reconnectSafe() error {
 
 // connectionMonitor monitors connection health and triggers reconnection when needed
 func (w *OTLPWriter) connectionMonitor() {
-	if w.Debug {
-		w.logger.Debug("connection monitor worker started")
-	}
+	w.debugf("connection monitor worker started")
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	
@@ -1737,9 +1714,7 @@ func (w *OTLPWriter) connectionMonitor() {
 		case <-ticker.C:
 			w.checkConnectionHealth()
 		case <-w.closeChan:
-			if w.Debug {
-				w.logger.Debug("connection monitor worker shutting down")
-			}
+			w.debugf("connection monitor worker shutting down")
 			return
 		}
 	}
