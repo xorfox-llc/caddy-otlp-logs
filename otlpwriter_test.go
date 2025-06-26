@@ -513,6 +513,7 @@ func TestOTLPWriteCloser_Write(t *testing.T) {
 		logsBatch: make([]*logspb.LogRecord, 0),
 		closeChan: make(chan struct{}),
 		BatchSize: 100, // Make sure batch size is set
+		initialized: true, // Mark as initialized for testing
 	}
 	
 	writer, _ := w.OpenWriter()
@@ -858,6 +859,7 @@ func TestOTLPWriter_BatchManagement(t *testing.T) {
 		closeChan: make(chan struct{}),
 		BatchSize: 3,
 		BatchTimeout: caddy.Duration(100 * time.Millisecond),
+		initialized: true, // Mark as initialized for testing
 	}
 	
 	// Mock log records
@@ -921,15 +923,28 @@ func TestOTLPWriter_ProtocolValidation(t *testing.T) {
 			})
 			defer cancel()
 			
+			// Provision never fails now - initialization happens asynchronously
 			err := w.Provision(ctx)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("Provision() error = %v, wantErr %v", err, tt.wantErr)
+			if err != nil {
+				t.Errorf("Provision() should not fail, got error: %v", err)
+				return
 			}
 			
-			if !tt.wantErr {
-				// Cleanup successful provisions
-				w.Cleanup()
+			if tt.wantErr {
+				// For invalid protocols, wait a moment and check if initialization failed
+				time.Sleep(100 * time.Millisecond)
+				if w.waitForInitialization() {
+					t.Errorf("Expected initialization to fail for invalid protocol %s, but it succeeded", tt.protocol)
+				}
+			} else {
+				// For valid protocols, initialization should succeed
+				if !w.waitForInitialization() {
+					t.Errorf("Expected initialization to succeed for valid protocol %s, but it failed", tt.protocol)
+				}
 			}
+			
+			// Cleanup
+			w.Cleanup()
 		})
 	}
 }

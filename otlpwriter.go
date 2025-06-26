@@ -96,6 +96,11 @@ type OTLPWriter struct {
 	closed       bool
 	closeChan    chan struct{}
 	failedBatches int64
+	
+	// Initialization state
+	initialized     bool
+	initMu          sync.RWMutex
+	initChan        chan struct{}
 
 	// Retry queue for failed batches
 	retryQueue     chan *retryItem
@@ -330,33 +335,76 @@ func (w *OTLPWriter) Provision(ctx caddy.Context) error {
 		w.resource.Attributes = append(w.resource.Attributes, toKeyValue(attr))
 	}
 
-	// Initialize client based on protocol
-	switch strings.ToLower(w.Protocol) {
-	case "grpc":
-		if err := w.initGRPCClient(); err != nil {
-			return err
-		}
-	case "http/protobuf", "http":
-		if err := w.initHTTPClient(); err != nil {
-			return err
-		}
-	default:
-		return fmt.Errorf("unsupported protocol: %s (supported: grpc, http/protobuf)", w.Protocol)
-	}
+	// Note: Cannot use logger OR initialize external connections during Provision 
+	// as we're part of the logging infrastructure being set up. Both logging calls
+	// and external operations (like gRPC connections) can trigger logging internally.
+	// All initialization will be deferred to worker threads.
 
-	// Note: Cannot use logger during Provision as we're part of the logging infrastructure
-	// being set up. Configuration details will be logged when workers start.
-
-	// Start batch processor
-	go w.batchProcessor()
-
-	// Start retry worker
-	go w.retryWorker()
+	// Initialize synchronization primitives
+	w.initChan = make(chan struct{})
 	
-	// Start connection monitor
-	go w.connectionMonitor()
+	// Start initialization worker that will safely set up clients and then start other workers
+	go w.initializeAndRun()
 
 	return nil
+}
+
+// initializeAndRun safely initializes clients and starts workers after logging is ready
+func (w *OTLPWriter) initializeAndRun() {
+	// Log that we're starting initialization (safe here as logger is initialized)
+	w.logger.Info("OTLP writer starting safe initialization",
+		zap.String("endpoint", w.Endpoint),
+		zap.String("protocol", w.Protocol))
+	
+	// Initialize client based on protocol - now safe as logging is ready
+	var err error
+	switch strings.ToLower(w.Protocol) {
+	case "grpc":
+		err = w.initGRPCClient()
+	case "http/protobuf", "http":
+		err = w.initHTTPClient()
+	default:
+		err = fmt.Errorf("unsupported protocol: %s (supported: grpc, http/protobuf)", w.Protocol)
+	}
+	
+	if err != nil {
+		w.logger.Error("failed to initialize OTLP client", zap.Error(err))
+		return
+	}
+	
+	// Mark as initialized
+	w.initMu.Lock()
+	w.initialized = true
+	close(w.initChan)
+	w.initMu.Unlock()
+	
+	w.logger.Info("OTLP client initialized successfully", 
+		zap.String("protocol", w.Protocol),
+		zap.String("endpoint", w.Endpoint))
+	
+	// Now start all the worker threads
+	go w.batchProcessor()
+	go w.retryWorker()
+	go w.connectionMonitor()
+}
+
+// waitForInitialization waits for the writer to be fully initialized
+func (w *OTLPWriter) waitForInitialization() bool {
+	w.initMu.RLock()
+	if w.initialized {
+		w.initMu.RUnlock()
+		return true
+	}
+	initChan := w.initChan
+	w.initMu.RUnlock()
+	
+	// Wait for initialization with timeout
+	select {
+	case <-initChan:
+		return true
+	case <-time.After(30 * time.Second):
+		return false
+	}
 }
 
 // String returns a human-readable string representation of this writer.
@@ -671,6 +719,13 @@ func (w *OTLPWriter) batchProcessor() {
 
 // addLog adds a log record to the batch.
 func (w *OTLPWriter) addLog(record *logspb.LogRecord) {
+	// Wait for initialization to complete before processing logs
+	if !w.waitForInitialization() {
+		// Initialization failed or timed out - log critical error to stderr
+		fmt.Fprintf(os.Stderr, "[CRITICAL] OTLP writer not initialized, dropping log entry\n")
+		return
+	}
+
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
