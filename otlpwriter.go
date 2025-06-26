@@ -33,6 +33,23 @@ import (
 	"google.golang.org/grpc/keepalive"
 )
 
+// debugf writes debug output to stderr to avoid circular logging dependencies
+func (w *OTLPWriter) debugf(format string, args ...interface{}) {
+	if w.Debug {
+		fmt.Fprintf(os.Stderr, "[DEBUG OTLP] "+format+"\n", args...)
+	}
+}
+
+// infof writes info output to stderr to avoid circular logging dependencies  
+func (w *OTLPWriter) infof(format string, args ...interface{}) {
+	fmt.Fprintf(os.Stderr, "[INFO OTLP] "+format+"\n", args...)
+}
+
+// warnf writes warning output to stderr to avoid circular logging dependencies
+func (w *OTLPWriter) warnf(format string, args ...interface{}) {
+	fmt.Fprintf(os.Stderr, "[WARN OTLP] "+format+"\n", args...)
+}
+
 func init() {
 	caddy.RegisterModule(&OTLPWriter{})
 }
@@ -168,20 +185,15 @@ func (w *OTLPWriter) checkConnectionHealth() {
 	healthy := w.connectionHealthy
 	w.mu.Unlock()
 	
-	if w.Debug {
-		w.logger.Debug("performing connection health check", 
-			zap.Duration("time_since_last_success", timeSinceLastSuccess),
-			zap.Bool("currently_healthy", healthy))
-	}
+	w.debugf("performing connection health check: time_since_last_success=%v, currently_healthy=%v", timeSinceLastSuccess, healthy)
 	
 	// If we haven't sent successfully in a while, try to reconnect
 	if timeSinceLastSuccess > 2*time.Minute {
-		w.logger.Warn("no successful sends recently, attempting reconnection",
-			zap.Duration("time_since_last_success", timeSinceLastSuccess))
+		w.warnf("no successful sends recently, attempting reconnection: time_since_last_success=%v", timeSinceLastSuccess)
 		if err := w.reconnect(); err != nil {
 			w.logger.Error("health check reconnection failed", zap.Error(err))
-		} else if w.Debug {
-			w.logger.Debug("health check reconnection successful")
+		} else {
+			w.debugf("health check reconnection successful")
 		}
 	}
 }
@@ -351,12 +363,14 @@ func (w *OTLPWriter) Provision(ctx caddy.Context) error {
 
 // initializeAndRun safely initializes clients and starts workers after logging is ready
 func (w *OTLPWriter) initializeAndRun() {
-	// Log that we're starting initialization (safe here as logger is initialized)
-	w.logger.Info("OTLP writer starting safe initialization",
-		zap.String("endpoint", w.Endpoint),
-		zap.String("protocol", w.Protocol))
+	// Note: Cannot use logger here as we're still part of the logging infrastructure setup
+	// Use stderr for critical debugging output instead
+	if w.Debug {
+		fmt.Fprintf(os.Stderr, "[DEBUG] OTLP writer starting safe initialization (endpoint: %s, protocol: %s)\n", 
+			w.Endpoint, w.Protocol)
+	}
 	
-	// Initialize client based on protocol - now safe as logging is ready
+	// Initialize client based on protocol
 	var err error
 	switch strings.ToLower(w.Protocol) {
 	case "grpc":
@@ -368,7 +382,7 @@ func (w *OTLPWriter) initializeAndRun() {
 	}
 	
 	if err != nil {
-		w.logger.Error("failed to initialize OTLP client", zap.Error(err))
+		fmt.Fprintf(os.Stderr, "[ERROR] OTLP writer failed to initialize client: %v\n", err)
 		return
 	}
 	
@@ -378,9 +392,10 @@ func (w *OTLPWriter) initializeAndRun() {
 	close(w.initChan)
 	w.initMu.Unlock()
 	
-	w.logger.Info("OTLP client initialized successfully", 
-		zap.String("protocol", w.Protocol),
-		zap.String("endpoint", w.Endpoint))
+	if w.Debug {
+		fmt.Fprintf(os.Stderr, "[DEBUG] OTLP client initialized successfully (protocol: %s, endpoint: %s)\n", 
+			w.Protocol, w.Endpoint)
+	}
 	
 	// Now start all the worker threads
 	go w.batchProcessor()
@@ -451,8 +466,7 @@ func (w *OTLPWriter) Cleanup() error {
 
 	// Process any remaining items in retry queue with extended timeout
 	if w.retryQueue != nil && len(w.retryQueue) > 0 {
-		w.logger.Info("processing remaining retry queue items", 
-			zap.Int("count", len(w.retryQueue)))
+		w.infof("processing remaining retry queue items: count=%d", len(w.retryQueue))
 		
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -482,7 +496,7 @@ func (w *OTLPWriter) Cleanup() error {
 		select {
 		case <-w.retryWorkerDone:
 		case <-time.After(5 * time.Second):
-			w.logger.Warn("retry worker did not finish in time")
+			w.warnf("retry worker did not finish in time")
 		}
 	}
 
@@ -681,19 +695,14 @@ func (w *OTLPWriter) batchProcessor() {
 		zap.String("service_name", w.ServiceName),
 	)
 	
-	if w.Debug {
-		w.logger.Debug("batch processor worker started", 
-			zap.Duration("batch_timeout", time.Duration(w.BatchTimeout)))
-	}
+	w.debugf("batch processor worker started: batch_timeout=%v", time.Duration(w.BatchTimeout))
 	ticker := time.NewTicker(time.Duration(w.BatchTimeout))
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-w.closeChan:
-			if w.Debug {
-				w.logger.Debug("batch processor worker shutting down")
-			}
+			w.debugf("batch processor worker shutting down")
 			return
 		case <-ticker.C:
 			w.mu.Lock()
@@ -708,8 +717,7 @@ func (w *OTLPWriter) batchProcessor() {
 					}
 				} else {
 					// Circuit breaker is open, keep batch for later
-					w.logger.Debug("skipping batch send due to open circuit breaker",
-						zap.Int("pending_logs", len(w.logsBatch)))
+					w.debugf("skipping batch send due to open circuit breaker: pending_logs=%d", len(w.logsBatch))
 				}
 			}
 			w.mu.Unlock()
@@ -731,17 +739,10 @@ func (w *OTLPWriter) addLog(record *logspb.LogRecord) {
 
 	w.logsBatch = append(w.logsBatch, record)
 	
-	if w.Debug {
-		w.logger.Debug("added log to batch", 
-			zap.Int("current_batch_size", len(w.logsBatch)),
-			zap.Int("max_batch_size", w.BatchSize))
-	}
+	w.debugf("added log to batch: current_batch_size=%d, max_batch_size=%d", len(w.logsBatch), w.BatchSize)
 
 	if len(w.logsBatch) >= w.BatchSize {
-		if w.Debug {
-			w.logger.Debug("batch size threshold reached, attempting to send", 
-				zap.Int("batch_size", len(w.logsBatch)))
-		}
+		w.debugf("batch size threshold reached, attempting to send: batch_size=%d", len(w.logsBatch))
 		// Check if circuit breaker allows sending
 		if w.circuitBreaker.canSend() {
 			logCount := len(w.logsBatch)
@@ -765,8 +766,7 @@ func (w *OTLPWriter) addLog(record *logspb.LogRecord) {
 					nextRetry: time.Now().Add(5 * time.Second),
 				}:
 					w.logsBatch = w.logsBatch[:0]
-					w.logger.Warn("circuit breaker open, queued oversized batch",
-						zap.Int("logs", len(batchCopy)))
+					w.warnf("circuit breaker open, queued oversized batch: logs=%d", len(batchCopy))
 				default:
 					// Retry queue full, have to drop oldest logs
 					dropped := len(w.logsBatch) - w.BatchSize
@@ -811,17 +811,11 @@ func (w *OTLPWriter) reportBatchError(err error, logCount int, location string) 
 // sendBatch sends the current batch of logs.
 func (w *OTLPWriter) sendBatch() error {
 	if len(w.logsBatch) == 0 {
-		if w.Debug {
-			w.logger.Debug("sendBatch called with empty batch")
-		}
+		w.debugf("sendBatch called with empty batch")
 		return nil
 	}
 	
-	if w.Debug {
-		w.logger.Debug("sending batch", 
-			zap.Int("logs_count", len(w.logsBatch)),
-			zap.String("protocol", w.Protocol))
-	}
+	w.debugf("sending batch: logs_count=%d, protocol=%s", len(w.logsBatch), w.Protocol)
 
 	// Make a copy of the batch for sending
 	batchCopy := make([]*logspb.LogRecord, len(w.logsBatch))
@@ -833,9 +827,7 @@ func (w *OTLPWriter) sendBatch() error {
 	// Only clear batch if send was successful
 	if err == nil {
 		w.logsBatch = w.logsBatch[:0]
-		if w.Debug {
-			w.logger.Debug("batch sent successfully, batch cleared")
-		}
+		w.debugf("batch sent successfully, batch cleared")
 		return nil
 	}
 	
@@ -843,8 +835,7 @@ func (w *OTLPWriter) sendBatch() error {
 	// Check if circuit breaker is open
 	if strings.Contains(err.Error(), "circuit breaker is open") {
 		// Don't clear batch yet - will retry when circuit breaker closes
-		w.logger.Debug("circuit breaker open, keeping batch for later retry", 
-			zap.Int("logs", len(w.logsBatch)))
+		w.debugf("circuit breaker open, keeping batch for later retry: logs=%d", len(w.logsBatch))
 		return err
 	}
 	
@@ -857,14 +848,11 @@ func (w *OTLPWriter) sendBatch() error {
 	}:
 		// Successfully queued - clear the batch
 		w.logsBatch = w.logsBatch[:0]
-		w.logger.Warn("queued failed batch for retry",
-			zap.Int("logs", len(batchCopy)),
-			zap.Error(err))
+		w.warnf("queued failed batch for retry: logs=%d, error=%v", len(batchCopy), err)
 	case <-w.closeChan:
 		// Channel is being closed, clear batch and return
 		w.logsBatch = w.logsBatch[:0]
-		w.logger.Debug("retry queue closed during send, dropping batch",
-			zap.Int("logs", len(batchCopy)))
+		w.debugf("retry queue closed during send, dropping batch: logs=%d", len(batchCopy))
 		return err
 	default:
 		// Retry queue is full - try to send oldest items first
