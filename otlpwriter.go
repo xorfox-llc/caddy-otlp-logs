@@ -689,6 +689,25 @@ func (w *OTLPWriter) batchProcessor() {
 	w.infof("OTLP log writer configured: endpoint=%s, protocol=%s, service_name=%s", 
 		w.Endpoint, w.Protocol, w.ServiceName)
 	
+	// Log headers if provided
+	if len(w.Headers) > 0 {
+		w.infof("OTLP headers configured:")
+		for k, v := range w.Headers {
+			// Mask sensitive values in headers for security
+			maskedValue := v
+			lowerKey := strings.ToLower(k)
+			if strings.Contains(lowerKey, "token") || strings.Contains(lowerKey, "key") || 
+			   strings.Contains(lowerKey, "secret") || strings.Contains(lowerKey, "auth") {
+				if len(v) > 8 {
+					maskedValue = v[:4] + "****" + v[len(v)-4:]
+				} else {
+					maskedValue = "****"
+				}
+			}
+			w.infof("  %s: %s", k, maskedValue)
+		}
+	}
+	
 	w.debugf("batch processor worker started: batch_timeout=%v", time.Duration(w.BatchTimeout))
 	ticker := time.NewTicker(time.Duration(w.BatchTimeout))
 	defer ticker.Stop()
@@ -753,6 +772,13 @@ func (w *OTLPWriter) addLog(record *logspb.LogRecord) {
 				batchCopy := make([]*logspb.LogRecord, len(w.logsBatch))
 				copy(batchCopy, w.logsBatch)
 				
+				// Check if we're already closed to avoid panic
+				if w.closed {
+					w.logsBatch = w.logsBatch[:0]
+					w.warnf("writer is closed, dropping oversized batch: logs=%d", len(batchCopy))
+					return
+				}
+
 				select {
 				case w.retryQueue <- &retryItem{
 					logs:      batchCopy,
@@ -833,6 +859,13 @@ func (w *OTLPWriter) sendBatch() error {
 		return err
 	}
 	
+	// Check if we're already closed to avoid panic
+	if w.closed {
+		w.logsBatch = w.logsBatch[:0]
+		w.debugf("writer is closed, dropping batch: logs=%d", len(batchCopy))
+		return fmt.Errorf("writer is closed")
+	}
+
 	// Try to queue for retry
 	select {
 	case w.retryQueue <- &retryItem{
@@ -1331,6 +1364,12 @@ func (w *OTLPWriter) retryWorker() {
 			if !w.circuitBreaker.canSend() {
 				// Requeue for later
 				item.nextRetry = time.Now().Add(10 * time.Second)
+				
+				// Don't try to requeue if we're shutting down
+				if w.retryQueue == nil {
+					return
+				}
+				
 				select {
 				case w.retryQueue <- item:
 					w.debugf("requeued item due to circuit breaker: logs=%d", len(item.logs))
