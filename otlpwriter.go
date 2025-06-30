@@ -25,6 +25,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 	collectorlogspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 )
 
@@ -510,7 +511,8 @@ func (w *OTLPWriter) initGRPCClient() error {
 	if u, err := url.Parse(endpoint); err == nil && u.Scheme != "" {
 		endpoint = u.Host
 		if endpoint == "" {
-			return fmt.Errorf("invalid endpoint: %s", w.Endpoint)
+			// Fallback to original endpoint if Host is empty (e.g., for "localhost:4317")
+			endpoint = w.Endpoint
 		}
 	}
 
@@ -548,7 +550,9 @@ func (w *OTLPWriter) initHTTPClient() error {
 // grpcHeaderInterceptor creates a gRPC interceptor for headers
 func (w *OTLPWriter) grpcHeaderInterceptor() grpc.UnaryClientInterceptor {
 	return func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
-		// Headers would be added here via metadata
+		// Add headers to context metadata
+		md := metadata.New(w.Headers)
+		ctx = metadata.NewOutgoingContext(ctx, md)
 		return invoker(ctx, method, req, reply, cc, opts...)
 	}
 }
