@@ -3,6 +3,7 @@ package otlplogs
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -29,11 +30,23 @@ import (
 	collectorlogspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 )
 
+var (
+	// globalWriters holds singleton instances of OTLP writers
+	globalWriters   = make(map[string]*globalOTLPWriter)
+	globalWritersMu sync.RWMutex
+)
+
+// globalOTLPWriter wraps the actual writer with reference counting
+type globalOTLPWriter struct {
+	*actualOTLPWriter
+	refCount int
+}
+
 func init() {
 	caddy.RegisterModule(OTLPWriter{})
 }
 
-// OTLPWriter implements a Caddy log writer that sends logs via OTLP.
+// OTLPWriter implements a Caddy log writer configuration that sends logs via OTLP.
 type OTLPWriter struct {
 	// Endpoint is the OTLP endpoint URL.
 	Endpoint string `json:"endpoint,omitempty"`
@@ -71,12 +84,20 @@ type OTLPWriter struct {
 	// Debug enables verbose debug logging for troubleshooting.
 	Debug bool `json:"debug,omitempty"`
 
+	key string // computed key for singleton lookup
+}
+
+// actualOTLPWriter is the actual implementation that handles OTLP export
+type actualOTLPWriter struct {
 	logger       *zap.Logger
 	resource     *resourcepb.Resource
 	grpcConn     *grpc.ClientConn
 	grpcClient   collectorlogspb.LogsServiceClient
 	httpClient   *http.Client
 	httpEndpoint string
+	
+	// Configuration (copied from OTLPWriter during provisioning)
+	config OTLPWriter
 	
 	// Simple batching
 	mu           sync.Mutex
@@ -109,8 +130,6 @@ func (OTLPWriter) CaddyModule() caddy.ModuleInfo {
 
 // Provision sets up the OTLP writer.
 func (w *OTLPWriter) Provision(ctx caddy.Context) error {
-	w.logger = ctx.Logger(w)
-
 	// Apply environment variables if not set
 	if w.Endpoint == "" {
 		if ep := os.Getenv("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"); ep != "" {
@@ -176,11 +195,159 @@ func (w *OTLPWriter) Provision(ctx caddy.Context) error {
 		}
 	}
 
+	// Validate protocol
+	switch strings.ToLower(w.Protocol) {
+	case "grpc", "http/protobuf", "http":
+		// Valid protocols
+	default:
+		return fmt.Errorf("unsupported protocol: %s (supported: grpc, http/protobuf)", w.Protocol)
+	}
+
+	// Compute the key for singleton lookup
+	w.key = w.WriterKey()
+
+	return nil
+}
+
+// OpenWriter returns a write closer that writes to the OTLP endpoint.
+func (w *OTLPWriter) OpenWriter() (io.WriteCloser, error) {
+	globalWritersMu.Lock()
+	defer globalWritersMu.Unlock()
+
+	// Check if we already have a writer for this key
+	gw, exists := globalWriters[w.key]
+	if exists {
+		gw.refCount++
+		if w.Debug {
+			gw.debugf("reusing existing OTLP writer: endpoint=%s, refcount=%d", w.Endpoint, gw.refCount)
+		}
+		return &otlpWriteCloser{actualWriter: gw.actualOTLPWriter, key: w.key}, nil
+	}
+
+	// Create a new actual writer
+	aw := &actualOTLPWriter{
+		config: *w,
+	}
+
+	// Initialize the actual writer
+	if err := aw.init(); err != nil {
+		return nil, fmt.Errorf("failed to initialize OTLP writer: %w", err)
+	}
+
+	// Store in global map
+	gw = &globalOTLPWriter{
+		actualOTLPWriter: aw,
+		refCount:         1,
+	}
+	globalWriters[w.key] = gw
+
+	if w.Debug {
+		aw.debugf("created new OTLP writer: endpoint=%s", w.Endpoint)
+	}
+
+	return &otlpWriteCloser{actualWriter: aw, key: w.key}, nil
+}
+
+// Cleanup cleans up resources but doesn't affect the singleton writers.
+func (w *OTLPWriter) Cleanup() error {
+	// The actual cleanup happens when the last WriteCloser is closed
+	return nil
+}
+
+// WriterKey returns a unique key for this writer configuration.
+func (w *OTLPWriter) WriterKey() string {
+	return fmt.Sprintf("otlp:%s:%s", w.Protocol, w.Endpoint)
+}
+
+// String returns a string representation of the writer.
+func (w *OTLPWriter) String() string {
+	return fmt.Sprintf("otlp writer to %s via %s", w.Endpoint, w.Protocol)
+}
+
+// otlpWriteCloser implements io.WriteCloser for the OTLP writer
+type otlpWriteCloser struct {
+	actualWriter *actualOTLPWriter
+	key          string
+}
+
+// Write implements io.Writer
+func (owc *otlpWriteCloser) Write(p []byte) (int, error) {
+	// Parse the log entry
+	var entry map[string]interface{}
+	if err := json.Unmarshal(p, &entry); err != nil {
+		owc.actualWriter.warnf("failed to parse log entry: %v", err)
+		return len(p), nil // Don't fail, just skip
+	}
+
+	// Convert to OTLP log record
+	record := &logspb.LogRecord{
+		TimeUnixNano: uint64(time.Now().UnixNano()),
+		Body:         toAnyValue(entry),
+	}
+
+	// Extract known fields
+	if level, ok := entry["level"].(string); ok {
+		record.SeverityNumber = toSeverityNumber(level)
+		record.SeverityText = level
+	}
+	if ts, ok := entry["ts"].(float64); ok {
+		record.TimeUnixNano = uint64(ts * 1e9)
+	}
+	if msg, ok := entry["msg"].(string); ok {
+		record.Body = toAnyValue(msg)
+		// Store full entry as attributes
+		record.Attributes = toAttributes(entry)
+	}
+	
+	// Extract trace context if present
+	if traceID, ok := entry["trace_id"].(string); ok {
+		if tid := parseTraceID(traceID); tid != nil {
+			record.TraceId = tid
+		}
+	}
+	if spanID, ok := entry["span_id"].(string); ok {
+		if sid := parseSpanID(spanID); sid != nil {
+			record.SpanId = sid
+		}
+	}
+
+	owc.actualWriter.addLog(record)
+	return len(p), nil
+}
+
+// Close implements io.Closer
+func (owc *otlpWriteCloser) Close() error {
+	globalWritersMu.Lock()
+	defer globalWritersMu.Unlock()
+
+	gw, exists := globalWriters[owc.key]
+	if !exists {
+		return nil // Already cleaned up
+	}
+
+	gw.refCount--
+	if gw.config.Debug {
+		gw.debugf("closing OTLP writer reference: endpoint=%s, refcount=%d", gw.config.Endpoint, gw.refCount)
+	}
+
+	if gw.refCount <= 0 {
+		// Last reference, clean up
+		delete(globalWriters, owc.key)
+		return gw.close()
+	}
+
+	return nil
+}
+
+// init initializes the actual OTLP writer
+func (w *actualOTLPWriter) init() error {
+	w.logger = zap.NewNop() // Use a no-op logger for now
+
 	// Create resource
 	attrs := []attribute.KeyValue{
-		attribute.String("service.name", w.ServiceName),
+		attribute.String("service.name", w.config.ServiceName),
 	}
-	for k, v := range w.ResourceAttributes {
+	for k, v := range w.config.ResourceAttributes {
 		attrs = append(attrs, attribute.String(k, v))
 	}
 	res, err := resource.New(context.Background(),
@@ -206,7 +373,7 @@ func (w *OTLPWriter) Provision(ctx caddy.Context) error {
 	w.workerDone = make(chan struct{})
 
 	// Initialize client based on protocol
-	switch strings.ToLower(w.Protocol) {
+	switch strings.ToLower(w.config.Protocol) {
 	case "grpc":
 		if err := w.initGRPCClient(); err != nil {
 			return fmt.Errorf("failed to initialize gRPC client: %w", err)
@@ -216,166 +383,22 @@ func (w *OTLPWriter) Provision(ctx caddy.Context) error {
 			return fmt.Errorf("failed to initialize HTTP client: %w", err)
 		}
 	default:
-		return fmt.Errorf("unsupported protocol: %s (supported: grpc, http/protobuf)", w.Protocol)
+		return fmt.Errorf("unsupported protocol: %s (supported: grpc, http/protobuf)", w.config.Protocol)
 	}
 
 	// Start worker
 	go w.worker()
 
-	if w.Debug {
+	if w.config.Debug {
 		w.debugf("OTLP log writer configured: endpoint=%s, protocol=%s, service_name=%s",
-			w.Endpoint, w.Protocol, w.ServiceName)
+			w.config.Endpoint, w.config.Protocol, w.config.ServiceName)
 	}
 
 	return nil
 }
 
-// worker processes batches in a single goroutine
-func (w *OTLPWriter) worker() {
-	ticker := time.NewTicker(time.Duration(w.BatchTimeout))
-	defer ticker.Stop()
-	defer close(w.workerDone)
-
-	if w.Debug {
-		w.debugf("batch processor worker started: batch_timeout=%s", w.BatchTimeout)
-	}
-
-	for {
-		select {
-		case batch := <-w.sendCh:
-			w.sendBatchWithRetry(batch)
-			
-		case <-ticker.C:
-			w.mu.Lock()
-			if len(w.logsBatch) > 0 {
-				batch := w.logsBatch
-				w.logsBatch = nil
-				w.mu.Unlock()
-				
-				select {
-				case w.sendCh <- batch:
-				default:
-					w.warnf("send channel full, dropping batch of %d logs", len(batch))
-				}
-			} else {
-				w.mu.Unlock()
-			}
-			
-		case <-w.stopCh:
-			if w.Debug {
-				w.debugf("worker received stop signal")
-			}
-			// Final flush
-			w.mu.Lock()
-			if len(w.logsBatch) > 0 {
-				batch := w.logsBatch
-				w.logsBatch = nil
-				w.mu.Unlock()
-				w.sendBatchWithRetry(batch)
-			} else {
-				w.mu.Unlock()
-			}
-			return
-		}
-	}
-}
-
-// addLog adds a log record to the batch
-func (w *OTLPWriter) addLog(record *logspb.LogRecord) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	
-	if w.closed {
-		return
-	}
-	
-	w.logsBatch = append(w.logsBatch, record)
-	
-	if w.Debug {
-		w.debugf("added log to batch: current_batch_size=%d, max_batch_size=%d", 
-			len(w.logsBatch), w.BatchSize)
-	}
-	
-	if len(w.logsBatch) >= w.BatchSize {
-		batch := w.logsBatch
-		w.logsBatch = nil
-		
-		select {
-		case w.sendCh <- batch:
-			if w.Debug {
-				w.debugf("batch size threshold reached, queued for sending: batch_size=%d", len(batch))
-			}
-		default:
-			w.warnf("send channel full, dropping batch of %d logs", len(batch))
-		}
-	}
-}
-
-// sendBatchWithRetry sends a batch with retry logic
-func (w *OTLPWriter) sendBatchWithRetry(logs []*logspb.LogRecord) {
-	var lastErr error
-	
-	for attempt := 0; attempt <= w.MaxRetries; attempt++ {
-		if attempt > 0 {
-			delay := time.Duration(w.RetryDelay) * time.Duration(attempt)
-			if w.Debug {
-				w.debugf("retrying batch send after %v (attempt %d/%d)", delay, attempt, w.MaxRetries)
-			}
-			time.Sleep(delay)
-		}
-		
-		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(w.Timeout))
-		err := w.sendBatch(ctx, logs)
-		cancel()
-		
-		if err == nil {
-			atomic.AddInt64(&w.sentBatches, 1)
-			if w.Debug {
-				w.debugf("successfully sent batch of %d logs", len(logs))
-			}
-			return
-		}
-		
-		lastErr = err
-		w.warnf("failed to send batch (attempt %d/%d): %v", attempt+1, w.MaxRetries, err)
-	}
-	
-	atomic.AddInt64(&w.failedBatches, 1)
-	w.errorf("failed to send batch after %d attempts: %v", w.MaxRetries+1, lastErr)
-}
-
-// sendBatch sends a batch of logs
-func (w *OTLPWriter) sendBatch(ctx context.Context, logs []*logspb.LogRecord) error {
-	req := &collectorlogspb.ExportLogsServiceRequest{
-		ResourceLogs: []*logspb.ResourceLogs{
-			{
-				Resource: w.resource,
-				ScopeLogs: []*logspb.ScopeLogs{
-					{
-						Scope: &commonpb.InstrumentationScope{
-							Name:    "caddy",
-							Version: "2.0.0",
-						},
-						LogRecords: logs,
-					},
-				},
-			},
-		},
-	}
-
-	switch strings.ToLower(w.Protocol) {
-	case "grpc":
-		_, err := w.grpcClient.Export(ctx, req)
-		return err
-	case "http/protobuf", "http":
-		return w.sendHTTPRequest(ctx, req)
-	default:
-		return fmt.Errorf("unsupported protocol: %s", w.Protocol)
-	}
-}
-
-// Cleanup shuts down the OTLP exporter
-func (w *OTLPWriter) Cleanup() error {
+// close shuts down the actual OTLP writer
+func (w *actualOTLPWriter) close() error {
 	w.mu.Lock()
 	if w.closed {
 		w.mu.Unlock()
@@ -411,108 +434,193 @@ func (w *OTLPWriter) Cleanup() error {
 	return nil
 }
 
-// WriterKey returns a unique key for this writer
-func (w *OTLPWriter) WriterKey() string {
-	return fmt.Sprintf("otlp:%s:%s", w.Protocol, w.Endpoint)
-}
+// worker processes batches in a single goroutine
+func (w *actualOTLPWriter) worker() {
+	ticker := time.NewTicker(time.Duration(w.config.BatchTimeout))
+	defer ticker.Stop()
+	defer close(w.workerDone)
 
-// String returns a string representation
-func (w *OTLPWriter) String() string {
-	return fmt.Sprintf("otlp writer to %s via %s", w.Endpoint, w.Protocol)
-}
-
-// OpenWriter returns a new write closer
-func (w *OTLPWriter) OpenWriter() (io.WriteCloser, error) {
-	return &otlpWriteCloser{writer: w}, nil
-}
-
-// otlpWriteCloser implements io.WriteCloser for OTLPWriter
-type otlpWriteCloser struct {
-	writer *OTLPWriter
-}
-
-// Write implements io.Writer
-func (owc *otlpWriteCloser) Write(p []byte) (int, error) {
-	// Parse the log entry
-	var entry map[string]interface{}
-	if err := json.Unmarshal(p, &entry); err != nil {
-		owc.writer.warnf("failed to parse log entry: %v", err)
-		return len(p), nil // Don't fail, just skip
+	if w.config.Debug {
+		w.debugf("batch processor worker started: batch_timeout=%s", w.config.BatchTimeout)
 	}
 
-	// Convert to OTLP log record
-	record := &logspb.LogRecord{
-		TimeUnixNano: uint64(time.Now().UnixNano()),
-		Body:         toAnyValue(entry),
+	for {
+		select {
+		case batch := <-w.sendCh:
+			w.sendBatchWithRetry(batch)
+			
+		case <-ticker.C:
+			w.mu.Lock()
+			if len(w.logsBatch) > 0 {
+				batch := w.logsBatch
+				w.logsBatch = nil
+				w.mu.Unlock()
+				
+				select {
+				case w.sendCh <- batch:
+				default:
+					w.warnf("send channel full, dropping batch of %d logs", len(batch))
+				}
+			} else {
+				w.mu.Unlock()
+			}
+			
+		case <-w.stopCh:
+			if w.config.Debug {
+				w.debugf("worker received stop signal")
+			}
+			// Final flush
+			w.mu.Lock()
+			if len(w.logsBatch) > 0 {
+				batch := w.logsBatch
+				w.logsBatch = nil
+				w.mu.Unlock()
+				w.sendBatchWithRetry(batch)
+			} else {
+				w.mu.Unlock()
+			}
+			return
+		}
 	}
-
-	// Extract known fields
-	if level, ok := entry["level"].(string); ok {
-		record.SeverityNumber = toSeverityNumber(level)
-		record.SeverityText = level
-	}
-	if ts, ok := entry["ts"].(float64); ok {
-		record.TimeUnixNano = uint64(ts * 1e9)
-	}
-	if msg, ok := entry["msg"].(string); ok {
-		record.Body = toAnyValue(msg)
-		// Store full entry as attributes
-		record.Attributes = toAttributes(entry)
-	}
-
-	owc.writer.addLog(record)
-	return len(p), nil
 }
 
-// Close implements io.Closer
-func (owc *otlpWriteCloser) Close() error {
-	// Nothing to do - cleanup happens at module level
-	return nil
+// addLog adds a log record to the batch
+func (w *actualOTLPWriter) addLog(record *logspb.LogRecord) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	
+	if w.closed {
+		return
+	}
+	
+	w.logsBatch = append(w.logsBatch, record)
+	
+	if w.config.Debug {
+		w.debugf("added log to batch: current_batch_size=%d, max_batch_size=%d", 
+			len(w.logsBatch), w.config.BatchSize)
+	}
+	
+	if len(w.logsBatch) >= w.config.BatchSize {
+		batch := w.logsBatch
+		w.logsBatch = nil
+		
+		select {
+		case w.sendCh <- batch:
+			if w.config.Debug {
+				w.debugf("batch size threshold reached, queued for sending: batch_size=%d", len(batch))
+			}
+		default:
+			w.warnf("send channel full, dropping batch of %d logs", len(batch))
+		}
+	}
+}
+
+// sendBatchWithRetry sends a batch with retry logic
+func (w *actualOTLPWriter) sendBatchWithRetry(logs []*logspb.LogRecord) {
+	var lastErr error
+	
+	for attempt := 0; attempt <= w.config.MaxRetries; attempt++ {
+		if attempt > 0 {
+			delay := time.Duration(w.config.RetryDelay) * time.Duration(attempt)
+			if w.config.Debug {
+				w.debugf("retrying batch send after %v (attempt %d/%d)", delay, attempt, w.config.MaxRetries)
+			}
+			time.Sleep(delay)
+		}
+		
+		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(w.config.Timeout))
+		err := w.sendBatch(ctx, logs)
+		cancel()
+		
+		if err == nil {
+			atomic.AddInt64(&w.sentBatches, 1)
+			if w.config.Debug {
+				w.debugf("successfully sent batch of %d logs", len(logs))
+			}
+			return
+		}
+		
+		lastErr = err
+		w.warnf("failed to send batch (attempt %d/%d): %v", attempt+1, w.config.MaxRetries, err)
+	}
+	
+	atomic.AddInt64(&w.failedBatches, 1)
+	w.errorf("failed to send batch after %d attempts: %v", w.config.MaxRetries+1, lastErr)
+}
+
+// sendBatch sends a batch of logs
+func (w *actualOTLPWriter) sendBatch(ctx context.Context, logs []*logspb.LogRecord) error {
+	req := &collectorlogspb.ExportLogsServiceRequest{
+		ResourceLogs: []*logspb.ResourceLogs{
+			{
+				Resource: w.resource,
+				ScopeLogs: []*logspb.ScopeLogs{
+					{
+						Scope: &commonpb.InstrumentationScope{
+							Name:    "caddy",
+							Version: "2.0.0",
+						},
+						LogRecords: logs,
+					},
+				},
+			},
+		},
+	}
+
+	switch strings.ToLower(w.config.Protocol) {
+	case "grpc":
+		_, err := w.grpcClient.Export(ctx, req)
+		return err
+	case "http/protobuf", "http":
+		return w.sendHTTPRequest(ctx, req)
+	default:
+		return fmt.Errorf("unsupported protocol: %s", w.config.Protocol)
+	}
 }
 
 // Helper methods for logging to stderr
-func (w *OTLPWriter) debugf(format string, args ...interface{}) {
-	if w.Debug {
+func (w *actualOTLPWriter) debugf(format string, args ...interface{}) {
+	if w.config.Debug {
 		fmt.Fprintf(os.Stderr, "[DEBUG OTLP] "+format+"\n", args...)
 	}
 }
 
-func (w *OTLPWriter) infof(format string, args ...interface{}) {
+func (w *actualOTLPWriter) infof(format string, args ...interface{}) {
 	fmt.Fprintf(os.Stderr, "[INFO OTLP] "+format+"\n", args...)
 }
 
-func (w *OTLPWriter) warnf(format string, args ...interface{}) {
+func (w *actualOTLPWriter) warnf(format string, args ...interface{}) {
 	fmt.Fprintf(os.Stderr, "[WARN OTLP] "+format+"\n", args...)
 }
 
-func (w *OTLPWriter) errorf(format string, args ...interface{}) {
+func (w *actualOTLPWriter) errorf(format string, args ...interface{}) {
 	fmt.Fprintf(os.Stderr, "[ERROR OTLP] "+format+"\n", args...)
 }
 
 // initGRPCClient initializes the gRPC client
-func (w *OTLPWriter) initGRPCClient() error {
+func (w *actualOTLPWriter) initGRPCClient() error {
 	opts := []grpc.DialOption{
 		grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(10 * 1024 * 1024)), // 10MB
 	}
 
-	if w.Insecure {
+	if w.config.Insecure {
 		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	} else {
 		opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(nil)))
 	}
 
 	// Add headers via interceptor if specified
-	if len(w.Headers) > 0 {
+	if len(w.config.Headers) > 0 {
 		opts = append(opts, grpc.WithUnaryInterceptor(w.grpcHeaderInterceptor()))
 	}
 
 	// Strip scheme from endpoint if present
-	endpoint := w.Endpoint
+	endpoint := w.config.Endpoint
 	if u, err := url.Parse(endpoint); err == nil && u.Scheme != "" {
 		endpoint = u.Host
 		if endpoint == "" {
 			// Fallback to original endpoint if Host is empty (e.g., for "localhost:4317")
-			endpoint = w.Endpoint
+			endpoint = w.config.Endpoint
 		}
 	}
 
@@ -527,13 +635,13 @@ func (w *OTLPWriter) initGRPCClient() error {
 }
 
 // initHTTPClient initializes the HTTP client
-func (w *OTLPWriter) initHTTPClient() error {
+func (w *actualOTLPWriter) initHTTPClient() error {
 	w.httpClient = &http.Client{
-		Timeout: time.Duration(w.Timeout),
+		Timeout: time.Duration(w.config.Timeout),
 	}
 
 	// Parse endpoint
-	u, err := url.Parse(w.Endpoint)
+	u, err := url.Parse(w.config.Endpoint)
 	if err != nil {
 		return fmt.Errorf("failed to parse endpoint URL: %w", err)
 	}
@@ -548,143 +656,19 @@ func (w *OTLPWriter) initHTTPClient() error {
 }
 
 // grpcHeaderInterceptor creates a gRPC interceptor for headers
-func (w *OTLPWriter) grpcHeaderInterceptor() grpc.UnaryClientInterceptor {
+func (w *actualOTLPWriter) grpcHeaderInterceptor() grpc.UnaryClientInterceptor {
 	return func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
 		// Add headers to context metadata
-		md := metadata.New(w.Headers)
+		md := metadata.New(w.config.Headers)
 		ctx = metadata.NewOutgoingContext(ctx, md)
 		return invoker(ctx, method, req, reply, cc, opts...)
 	}
 }
 
 // sendHTTPRequest sends logs via HTTP/protobuf
-func (w *OTLPWriter) sendHTTPRequest(ctx context.Context, req *collectorlogspb.ExportLogsServiceRequest) error {
+func (w *actualOTLPWriter) sendHTTPRequest(ctx context.Context, req *collectorlogspb.ExportLogsServiceRequest) error {
 	// Implementation would marshal to protobuf and send via HTTP
 	return fmt.Errorf("HTTP/protobuf protocol not yet implemented")
-}
-
-// Helper functions for OTLP conversion
-
-func toKeyValue(attr attribute.KeyValue) *commonpb.KeyValue {
-	kv := &commonpb.KeyValue{
-		Key: string(attr.Key),
-	}
-	
-	switch attr.Value.Type() {
-	case attribute.STRING:
-		kv.Value = &commonpb.AnyValue{
-			Value: &commonpb.AnyValue_StringValue{
-				StringValue: attr.Value.AsString(),
-			},
-		}
-	case attribute.BOOL:
-		kv.Value = &commonpb.AnyValue{
-			Value: &commonpb.AnyValue_BoolValue{
-				BoolValue: attr.Value.AsBool(),
-			},
-		}
-	case attribute.INT64:
-		kv.Value = &commonpb.AnyValue{
-			Value: &commonpb.AnyValue_IntValue{
-				IntValue: attr.Value.AsInt64(),
-			},
-		}
-	case attribute.FLOAT64:
-		kv.Value = &commonpb.AnyValue{
-			Value: &commonpb.AnyValue_DoubleValue{
-				DoubleValue: attr.Value.AsFloat64(),
-			},
-		}
-	default:
-		kv.Value = &commonpb.AnyValue{
-			Value: &commonpb.AnyValue_StringValue{
-				StringValue: attr.Value.AsString(),
-			},
-		}
-	}
-	
-	return kv
-}
-
-func toAnyValue(v interface{}) *commonpb.AnyValue {
-	switch val := v.(type) {
-	case string:
-		return &commonpb.AnyValue{
-			Value: &commonpb.AnyValue_StringValue{StringValue: val},
-		}
-	case bool:
-		return &commonpb.AnyValue{
-			Value: &commonpb.AnyValue_BoolValue{BoolValue: val},
-		}
-	case int, int32, int64:
-		return &commonpb.AnyValue{
-			Value: &commonpb.AnyValue_IntValue{IntValue: toInt64(val)},
-		}
-	case float32, float64:
-		return &commonpb.AnyValue{
-			Value: &commonpb.AnyValue_DoubleValue{DoubleValue: toFloat64(val)},
-		}
-	case map[string]interface{}:
-		return &commonpb.AnyValue{
-			Value: &commonpb.AnyValue_KvlistValue{
-				KvlistValue: toKeyValueList(val),
-			},
-		}
-	default:
-		// Fallback to string representation
-		return &commonpb.AnyValue{
-			Value: &commonpb.AnyValue_StringValue{StringValue: fmt.Sprintf("%v", val)},
-		}
-	}
-}
-
-func toAttributes(m map[string]interface{}) []*commonpb.KeyValue {
-	attrs := make([]*commonpb.KeyValue, 0, len(m))
-	for k, v := range m {
-		attrs = append(attrs, &commonpb.KeyValue{
-			Key:   k,
-			Value: toAnyValue(v),
-		})
-	}
-	return attrs
-}
-
-func toKeyValueList(m map[string]interface{}) *commonpb.KeyValueList {
-	return &commonpb.KeyValueList{
-		Values: toAttributes(m),
-	}
-}
-
-func toSeverityNumber(level string) logspb.SeverityNumber {
-	switch strings.ToLower(level) {
-	case "trace":
-		return logspb.SeverityNumber_SEVERITY_NUMBER_TRACE
-	case "debug":
-		return logspb.SeverityNumber_SEVERITY_NUMBER_DEBUG
-	case "info":
-		return logspb.SeverityNumber_SEVERITY_NUMBER_INFO
-	case "warn", "warning":
-		return logspb.SeverityNumber_SEVERITY_NUMBER_WARN
-	case "error":
-		return logspb.SeverityNumber_SEVERITY_NUMBER_ERROR
-	case "fatal":
-		return logspb.SeverityNumber_SEVERITY_NUMBER_FATAL
-	default:
-		return logspb.SeverityNumber_SEVERITY_NUMBER_UNSPECIFIED
-	}
-}
-
-func toInt64(v interface{}) int64 {
-	switch val := v.(type) {
-	case int:
-		return int64(val)
-	case int32:
-		return int64(val)
-	case int64:
-		return val
-	default:
-		return 0
-	}
 }
 
 // parseHeadersFromEnv parses headers from environment variable
@@ -825,6 +809,130 @@ func (w *OTLPWriter) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	return nil
 }
 
+// Helper functions for OTLP conversion
+
+func toKeyValue(attr attribute.KeyValue) *commonpb.KeyValue {
+	kv := &commonpb.KeyValue{
+		Key: string(attr.Key),
+	}
+	
+	switch attr.Value.Type() {
+	case attribute.STRING:
+		kv.Value = &commonpb.AnyValue{
+			Value: &commonpb.AnyValue_StringValue{
+				StringValue: attr.Value.AsString(),
+			},
+		}
+	case attribute.BOOL:
+		kv.Value = &commonpb.AnyValue{
+			Value: &commonpb.AnyValue_BoolValue{
+				BoolValue: attr.Value.AsBool(),
+			},
+		}
+	case attribute.INT64:
+		kv.Value = &commonpb.AnyValue{
+			Value: &commonpb.AnyValue_IntValue{
+				IntValue: attr.Value.AsInt64(),
+			},
+		}
+	case attribute.FLOAT64:
+		kv.Value = &commonpb.AnyValue{
+			Value: &commonpb.AnyValue_DoubleValue{
+				DoubleValue: attr.Value.AsFloat64(),
+			},
+		}
+	default:
+		kv.Value = &commonpb.AnyValue{
+			Value: &commonpb.AnyValue_StringValue{
+				StringValue: attr.Value.AsString(),
+			},
+		}
+	}
+	
+	return kv
+}
+
+func toAnyValue(v interface{}) *commonpb.AnyValue {
+	switch val := v.(type) {
+	case string:
+		return &commonpb.AnyValue{
+			Value: &commonpb.AnyValue_StringValue{StringValue: val},
+		}
+	case bool:
+		return &commonpb.AnyValue{
+			Value: &commonpb.AnyValue_BoolValue{BoolValue: val},
+		}
+	case int, int32, int64:
+		return &commonpb.AnyValue{
+			Value: &commonpb.AnyValue_IntValue{IntValue: toInt64(val)},
+		}
+	case float32, float64:
+		return &commonpb.AnyValue{
+			Value: &commonpb.AnyValue_DoubleValue{DoubleValue: toFloat64(val)},
+		}
+	case map[string]interface{}:
+		return &commonpb.AnyValue{
+			Value: &commonpb.AnyValue_KvlistValue{
+				KvlistValue: toKeyValueList(val),
+			},
+		}
+	default:
+		// Fallback to string representation
+		return &commonpb.AnyValue{
+			Value: &commonpb.AnyValue_StringValue{StringValue: fmt.Sprintf("%v", val)},
+		}
+	}
+}
+
+func toAttributes(m map[string]interface{}) []*commonpb.KeyValue {
+	attrs := make([]*commonpb.KeyValue, 0, len(m))
+	for k, v := range m {
+		attrs = append(attrs, &commonpb.KeyValue{
+			Key:   k,
+			Value: toAnyValue(v),
+		})
+	}
+	return attrs
+}
+
+func toKeyValueList(m map[string]interface{}) *commonpb.KeyValueList {
+	return &commonpb.KeyValueList{
+		Values: toAttributes(m),
+	}
+}
+
+func toSeverityNumber(level string) logspb.SeverityNumber {
+	switch strings.ToLower(level) {
+	case "trace":
+		return logspb.SeverityNumber_SEVERITY_NUMBER_TRACE
+	case "debug":
+		return logspb.SeverityNumber_SEVERITY_NUMBER_DEBUG
+	case "info":
+		return logspb.SeverityNumber_SEVERITY_NUMBER_INFO
+	case "warn", "warning":
+		return logspb.SeverityNumber_SEVERITY_NUMBER_WARN
+	case "error":
+		return logspb.SeverityNumber_SEVERITY_NUMBER_ERROR
+	case "fatal":
+		return logspb.SeverityNumber_SEVERITY_NUMBER_FATAL
+	default:
+		return logspb.SeverityNumber_SEVERITY_NUMBER_UNSPECIFIED
+	}
+}
+
+func toInt64(v interface{}) int64 {
+	switch val := v.(type) {
+	case int:
+		return int64(val)
+	case int32:
+		return int64(val)
+	case int64:
+		return val
+	default:
+		return 0
+	}
+}
+
 func toFloat64(v interface{}) float64 {
 	switch val := v.(type) {
 	case float32:
@@ -834,4 +942,75 @@ func toFloat64(v interface{}) float64 {
 	default:
 		return 0
 	}
+}
+
+// parseTraceID parses a trace ID from string to 16-byte array
+// Supports both 32-character hex string and 16-byte binary formats
+func parseTraceID(traceID string) []byte {
+	// Remove any dashes or spaces
+	traceID = strings.ReplaceAll(traceID, "-", "")
+	traceID = strings.ReplaceAll(traceID, " ", "")
+	
+	// Check if it's a valid 32-character hex string (16 bytes)
+	if len(traceID) == 32 {
+		if b, err := hex.DecodeString(traceID); err == nil && len(b) == 16 {
+			return b
+		}
+	}
+	
+	return nil
+}
+
+// parseSpanID parses a span ID from string to 8-byte array
+// Supports both 16-character hex string and 8-byte binary formats
+func parseSpanID(spanID string) []byte {
+	// Remove any dashes or spaces
+	spanID = strings.ReplaceAll(spanID, "-", "")
+	spanID = strings.ReplaceAll(spanID, " ", "")
+	
+	// Check if it's a valid 16-character hex string (8 bytes)
+	if len(spanID) == 16 {
+		if b, err := hex.DecodeString(spanID); err == nil && len(b) == 8 {
+			return b
+		}
+	}
+	
+	return nil
+}
+
+// Test helpers - only exposed for testing
+type testHelper interface {
+	setGRPCClient(client collectorlogspb.LogsServiceClient)
+	getActualWriter() *actualOTLPWriter
+}
+
+// testWriteCloser wraps otlpWriteCloser to expose test methods
+type testWriteCloser struct {
+	*otlpWriteCloser
+}
+
+func (twc *testWriteCloser) setGRPCClient(client collectorlogspb.LogsServiceClient) {
+	if twc.otlpWriteCloser != nil && twc.otlpWriteCloser.actualWriter != nil {
+		twc.otlpWriteCloser.actualWriter.grpcClient = client
+	}
+}
+
+func (twc *testWriteCloser) getActualWriter() *actualOTLPWriter {
+	if twc.otlpWriteCloser != nil {
+		return twc.otlpWriteCloser.actualWriter
+	}
+	return nil
+}
+
+// openWriterForTest returns a write closer with test capabilities
+func (w *OTLPWriter) openWriterForTest() (*testWriteCloser, error) {
+	wc, err := w.OpenWriter()
+	if err != nil {
+		return nil, err
+	}
+	owc, ok := wc.(*otlpWriteCloser)
+	if !ok {
+		return nil, fmt.Errorf("unexpected writer type")
+	}
+	return &testWriteCloser{otlpWriteCloser: owc}, nil
 }

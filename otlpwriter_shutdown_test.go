@@ -18,12 +18,12 @@ import (
 func TestOTLPWriter_NoPanicOnShutdown(t *testing.T) {
 	tests := []struct {
 		name        string
-		scenario    func(t *testing.T, w *OTLPWriter, wc *otlpWriteCloser)
+		scenario    func(t *testing.T, w *OTLPWriter, twc *testWriteCloser)
 		description string
 	}{
 		{
 			name: "shutdown during writes",
-			scenario: func(t *testing.T, w *OTLPWriter, wc *otlpWriteCloser) {
+			scenario: func(t *testing.T, w *OTLPWriter, twc *testWriteCloser) {
 				// Start writing logs concurrently
 				var wg sync.WaitGroup
 				stopWriting := make(chan struct{})
@@ -47,7 +47,7 @@ func TestOTLPWriter_NoPanicOnShutdown(t *testing.T) {
 									"id":    id,
 								}
 								data, _ := json.Marshal(log)
-								wc.Write(data) // Ignore errors during shutdown
+								twc.Write(data) // Ignore errors during shutdown
 							}
 						}
 					}(i)
@@ -56,8 +56,8 @@ func TestOTLPWriter_NoPanicOnShutdown(t *testing.T) {
 				// Let writers run for a bit
 				time.Sleep(50 * time.Millisecond)
 				
-				// Shutdown while writes are happening
-				err := w.Cleanup()
+				// Close the writer while writes are happening
+				err := twc.Close()
 				assert.NoError(t, err)
 				
 				// Stop writers
@@ -68,7 +68,7 @@ func TestOTLPWriter_NoPanicOnShutdown(t *testing.T) {
 		},
 		{
 			name: "shutdown with full batch",
-			scenario: func(t *testing.T, w *OTLPWriter, wc *otlpWriteCloser) {
+			scenario: func(t *testing.T, w *OTLPWriter, twc *testWriteCloser) {
 				// Fill up to just below batch size
 				for i := 0; i < w.BatchSize-1; i++ {
 					log := map[string]interface{}{
@@ -77,39 +77,43 @@ func TestOTLPWriter_NoPanicOnShutdown(t *testing.T) {
 						"seq":   i,
 					}
 					data, _ := json.Marshal(log)
-					_, err := wc.Write(data)
+					_, err := twc.Write(data)
 					assert.NoError(t, err)
 				}
 				
-				// Shutdown with pending logs
-				err := w.Cleanup()
+				// Close with pending logs
+				err := twc.Close()
 				assert.NoError(t, err)
 			},
 			description: "should flush pending logs on shutdown",
 		},
 		{
 			name: "rapid shutdown after provision",
-			scenario: func(t *testing.T, w *OTLPWriter, wc *otlpWriteCloser) {
-				// Immediately shutdown after getting writer
-				err := w.Cleanup()
+			scenario: func(t *testing.T, w *OTLPWriter, twc *testWriteCloser) {
+				// Immediately close after getting writer
+				err := twc.Close()
 				assert.NoError(t, err)
 			},
 			description: "should handle immediate shutdown",
 		},
 		{
 			name: "write after shutdown",
-			scenario: func(t *testing.T, w *OTLPWriter, wc *otlpWriteCloser) {
-				// Shutdown first
-				err := w.Cleanup()
+			scenario: func(t *testing.T, w *OTLPWriter, twc *testWriteCloser) {
+				// Get the actual writer to check closed state
+				aw := twc.getActualWriter()
+				require.NotNil(t, aw)
+				
+				// Close first
+				err := twc.Close()
 				assert.NoError(t, err)
 				
-				// Try to write after shutdown
+				// Try to write after close
 				log := map[string]interface{}{
 					"level": "info",
 					"msg":   "write after close",
 				}
 				data, _ := json.Marshal(log)
-				_, err = wc.Write(data)
+				_, err = twc.Write(data)
 				// Should not panic, just silently drop
 				assert.NoError(t, err)
 			},
@@ -117,16 +121,16 @@ func TestOTLPWriter_NoPanicOnShutdown(t *testing.T) {
 		},
 		{
 			name: "multiple cleanup calls",
-			scenario: func(t *testing.T, w *OTLPWriter, wc *otlpWriteCloser) {
-				// First cleanup
-				err := w.Cleanup()
+			scenario: func(t *testing.T, w *OTLPWriter, twc *testWriteCloser) {
+				// Close the writer
+				err := twc.Close()
 				assert.NoError(t, err)
 				
-				// Second cleanup - should be idempotent
+				// OTLPWriter.Cleanup() does nothing in singleton pattern
 				err = w.Cleanup()
 				assert.NoError(t, err)
 				
-				// Third cleanup for good measure
+				// Multiple cleanup calls should be safe
 				err = w.Cleanup()
 				assert.NoError(t, err)
 			},
@@ -136,6 +140,11 @@ func TestOTLPWriter_NoPanicOnShutdown(t *testing.T) {
 	
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			// Clear any existing writers
+			globalWritersMu.Lock()
+			globalWriters = make(map[string]*globalOTLPWriter)
+			globalWritersMu.Unlock()
+
 			// Create writer with small batch for faster testing
 			w := &OTLPWriter{
 				Endpoint:     "localhost:4317",
@@ -155,14 +164,16 @@ func TestOTLPWriter_NoPanicOnShutdown(t *testing.T) {
 			}
 			
 			require.NoError(t, w.Provision(ctx))
-			w.grpcClient = mockClient
 			
-			wc, err := w.OpenWriter()
+			// Get a test write closer
+			twc, err := w.openWriterForTest()
 			require.NoError(t, err)
-			owc := wc.(*otlpWriteCloser)
+			
+			// Set the mock client
+			twc.setGRPCClient(mockClient)
 			
 			// Run the test scenario
-			tt.scenario(t, w, owc)
+			tt.scenario(t, w, twc)
 			
 			// Verify no panic occurred (test will fail if panic happens)
 			t.Logf("✓ %s: %s", tt.name, tt.description)
@@ -175,6 +186,11 @@ func TestOTLPWriter_StressShutdown(t *testing.T) {
 	// Run multiple iterations to catch race conditions
 	for i := 0; i < 10; i++ {
 		t.Run(string(rune('A'+i)), func(t *testing.T) {
+			// Clear any existing writers
+			globalWritersMu.Lock()
+			globalWriters = make(map[string]*globalOTLPWriter)
+			globalWritersMu.Unlock()
+
 			w := &OTLPWriter{
 				Endpoint:     "localhost:4317",
 				Protocol:     "grpc",
@@ -193,10 +209,13 @@ func TestOTLPWriter_StressShutdown(t *testing.T) {
 			}
 			
 			require.NoError(t, w.Provision(ctx))
-			w.grpcClient = mockClient
 			
-			wc, err := w.OpenWriter()
+			// Get a test write closer
+			twc, err := w.openWriterForTest()
 			require.NoError(t, err)
+			
+			// Set the mock client
+			twc.setGRPCClient(mockClient)
 			
 			// Stress test: many goroutines writing
 			var wg sync.WaitGroup
@@ -219,7 +238,7 @@ func TestOTLPWriter_StressShutdown(t *testing.T) {
 								"seq":   k,
 							}
 							data, _ := json.Marshal(log)
-							wc.Write(data)
+							twc.Write(data)
 						}
 					}
 				}(j)
@@ -230,7 +249,7 @@ func TestOTLPWriter_StressShutdown(t *testing.T) {
 			
 			// Shutdown in the middle of writes
 			close(stopCh)
-			err = w.Cleanup()
+			err = twc.Close()
 			assert.NoError(t, err)
 			
 			// Wait for writers to finish

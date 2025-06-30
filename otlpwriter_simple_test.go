@@ -116,16 +116,19 @@ func TestOTLPWriter_Provision(t *testing.T) {
 				assert.Error(t, err)
 			} else {
 				assert.NoError(t, err)
-				assert.NotNil(t, tt.writer.resource)
-				assert.NotNil(t, tt.writer.sendCh)
-				assert.NotNil(t, tt.writer.stopCh)
-				assert.NotNil(t, tt.writer.workerDone)
+				// The writer is now properly provisioned
+				// Internal state is managed by actualOTLPWriter
 			}
 		})
 	}
 }
 
 func TestOTLPWriter_WriteAndBatch(t *testing.T) {
+	// Clear any existing writers
+	globalWritersMu.Lock()
+	globalWriters = make(map[string]*globalOTLPWriter)
+	globalWritersMu.Unlock()
+
 	// Create a test writer with small batch size
 	w := &OTLPWriter{
 		Endpoint:     "localhost:4317",
@@ -145,11 +148,14 @@ func TestOTLPWriter_WriteAndBatch(t *testing.T) {
 	}
 	
 	require.NoError(t, w.Provision(ctx))
-	w.grpcClient = mockClient
 	
-	// Get a write closer
-	wc, err := w.OpenWriter()
+	// Get a test write closer
+	twc, err := w.openWriterForTest()
 	require.NoError(t, err)
+	defer twc.Close()
+	
+	// Set the mock client
+	twc.setGRPCClient(mockClient)
 	
 	// Write logs
 	logs := []map[string]interface{}{
@@ -160,7 +166,7 @@ func TestOTLPWriter_WriteAndBatch(t *testing.T) {
 	
 	for _, log := range logs {
 		data, _ := json.Marshal(log)
-		_, err := wc.Write(data)
+		_, err := twc.Write(data)
 		assert.NoError(t, err)
 	}
 	
@@ -169,6 +175,104 @@ func TestOTLPWriter_WriteAndBatch(t *testing.T) {
 	
 	// Verify batches were sent
 	assert.GreaterOrEqual(t, len(mockClient.getRequests()), 1)
+	
+	// Cleanup
+	assert.NoError(t, w.Cleanup())
+}
+
+func TestOTLPWriter_TraceContext(t *testing.T) {
+	// Create a test writer
+	w := &OTLPWriter{
+		Endpoint:     "localhost:4317",
+		Protocol:     "grpc",
+		BatchSize:    10,
+		BatchTimeout: caddy.Duration(100 * time.Millisecond),
+		Insecure:     true,
+	}
+	
+	// Mock the gRPC client
+	mockClient := &mockLogsServiceClient{
+		responses: make(chan *collectorlogspb.ExportLogsServiceResponse, 10),
+	}
+	
+	ctx := caddy.Context{
+		Context: context.Background(),
+	}
+	
+	require.NoError(t, w.Provision(ctx))
+	
+	// Get a test write closer
+	twc, err := w.openWriterForTest()
+	require.NoError(t, err)
+	defer twc.Close()
+	
+	// Set the mock client
+	twc.setGRPCClient(mockClient)
+	
+	// Write logs with trace context
+	logs := []map[string]interface{}{
+		{
+			"level":    "info",
+			"msg":      "test with trace context",
+			"ts":       float64(time.Now().Unix()),
+			"trace_id": "0123456789abcdef0123456789abcdef",
+			"span_id":  "0123456789abcdef",
+		},
+		{
+			"level":    "error",
+			"msg":      "test with dashed trace id",
+			"ts":       float64(time.Now().Unix()),
+			"trace_id": "01234567-89ab-cdef-0123-456789abcdef",
+			"span_id":  "01234567-89abcdef",
+		},
+		{
+			"level": "debug",
+			"msg":   "test without trace context",
+			"ts":    float64(time.Now().Unix()),
+		},
+		{
+			"level":    "info",
+			"msg":      "test with invalid trace id",
+			"ts":       float64(time.Now().Unix()),
+			"trace_id": "invalid",
+			"span_id":  "0123456789abcdef",
+		},
+	}
+	
+	for _, log := range logs {
+		data, _ := json.Marshal(log)
+		_, err := twc.Write(data)
+		assert.NoError(t, err)
+	}
+	
+	// Wait for batch to be sent
+	time.Sleep(200 * time.Millisecond)
+	
+	// Verify the logs were sent with correct trace context
+	requests := mockClient.getRequests()
+	require.Len(t, requests, 1)
+	require.Len(t, requests[0].ResourceLogs, 1)
+	require.Len(t, requests[0].ResourceLogs[0].ScopeLogs, 1)
+	logRecords := requests[0].ResourceLogs[0].ScopeLogs[0].LogRecords
+	require.Len(t, logRecords, 4)
+	
+	// First log should have valid trace and span IDs
+	assert.Len(t, logRecords[0].TraceId, 16)
+	assert.Len(t, logRecords[0].SpanId, 8)
+	assert.Equal(t, []byte{0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef}, logRecords[0].TraceId)
+	assert.Equal(t, []byte{0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef}, logRecords[0].SpanId)
+	
+	// Second log should handle dashed IDs correctly
+	assert.Len(t, logRecords[1].TraceId, 16)
+	assert.Len(t, logRecords[1].SpanId, 8)
+	
+	// Third log should have no trace context
+	assert.Len(t, logRecords[2].TraceId, 0)
+	assert.Len(t, logRecords[2].SpanId, 0)
+	
+	// Fourth log should have no trace ID (invalid) but valid span ID
+	assert.Len(t, logRecords[3].TraceId, 0)
+	assert.Len(t, logRecords[3].SpanId, 8)
 	
 	// Cleanup
 	assert.NoError(t, w.Cleanup())
@@ -192,10 +296,14 @@ func TestOTLPWriter_BatchTimeout(t *testing.T) {
 	}
 	
 	require.NoError(t, w.Provision(ctx))
-	w.grpcClient = mockClient
 	
-	wc, err := w.OpenWriter()
+	// Get a test write closer
+	twc, err := w.openWriterForTest()
 	require.NoError(t, err)
+	defer twc.Close()
+	
+	// Set the mock client
+	twc.setGRPCClient(mockClient)
 	
 	// Write only one log (less than batch size)
 	log := map[string]interface{}{
@@ -204,7 +312,7 @@ func TestOTLPWriter_BatchTimeout(t *testing.T) {
 		"ts":    float64(time.Now().Unix()),
 	}
 	data, _ := json.Marshal(log)
-	_, err = wc.Write(data)
+	_, err = twc.Write(data)
 	assert.NoError(t, err)
 	
 	// Wait for timeout to trigger
@@ -237,10 +345,14 @@ func TestOTLPWriter_ConcurrentWrites(t *testing.T) {
 	}
 	
 	require.NoError(t, w.Provision(ctx))
-	w.grpcClient = mockClient
 	
-	wc, err := w.OpenWriter()
+	// Get a test write closer
+	twc, err := w.openWriterForTest()
 	require.NoError(t, err)
+	defer twc.Close()
+	
+	// Set the mock client
+	twc.setGRPCClient(mockClient)
 	
 	// Concurrent writes
 	var wg sync.WaitGroup
@@ -259,7 +371,7 @@ func TestOTLPWriter_ConcurrentWrites(t *testing.T) {
 					"goroutine": id,
 				}
 				data, _ := json.Marshal(log)
-				_, err := wc.Write(data)
+				_, err := twc.Write(data)
 				assert.NoError(t, err)
 			}
 		}(i)
@@ -315,8 +427,7 @@ func TestOTLPWriter_Cleanup(t *testing.T) {
 	err = w.Cleanup()
 	assert.NoError(t, err)
 	
-	// Verify closed state
-	assert.True(t, w.closed)
+	// In singleton pattern, closed state is per writer, not per config
 	
 	// Second cleanup should be safe
 	err = w.Cleanup()
@@ -560,28 +671,31 @@ func captureStderr(f func()) string {
 }
 
 func TestOTLPWriter_DebugLogging(t *testing.T) {
-	w := &OTLPWriter{
-		Debug: true,
+	// Test using actualOTLPWriter directly since it has the logging methods
+	aw := &actualOTLPWriter{
+		config: OTLPWriter{
+			Debug: true,
+		},
 	}
 	
 	// Test debug logging
 	output := captureStderr(func() {
-		w.debugf("test debug message: %s", "value")
+		aw.debugf("test debug message: %s", "value")
 	})
 	assert.Contains(t, output, "[DEBUG OTLP] test debug message: value")
 	
 	// Test with debug disabled
-	w.Debug = false
+	aw.config.Debug = false
 	output = captureStderr(func() {
-		w.debugf("should not appear")
+		aw.debugf("should not appear")
 	})
 	assert.Empty(t, output)
 	
 	// Test other log levels
 	output = captureStderr(func() {
-		w.infof("info message")
-		w.warnf("warning message")
-		w.errorf("error message")
+		aw.infof("info message")
+		aw.warnf("warning message")
+		aw.errorf("error message")
 	})
 	assert.Contains(t, output, "[INFO OTLP] info message")
 	assert.Contains(t, output, "[WARN OTLP] warning message")
@@ -589,6 +703,11 @@ func TestOTLPWriter_DebugLogging(t *testing.T) {
 }
 
 func TestOTLPWriter_RetryLogic(t *testing.T) {
+	// Clear any existing writers
+	globalWritersMu.Lock()
+	globalWriters = make(map[string]*globalOTLPWriter)
+	globalWritersMu.Unlock()
+
 	w := &OTLPWriter{
 		Endpoint:     "localhost:4317",
 		Protocol:     "grpc",
@@ -601,13 +720,13 @@ func TestOTLPWriter_RetryLogic(t *testing.T) {
 	}
 	
 	// Track retry attempts
-	attemptCount := 0
+	var attemptCount int32
 	
 	// Create a custom mock that tracks attempts
 	mockClient := &trackingMockClient{
 		failCount: 1, // Fail first attempt only
 		onExport: func() {
-			attemptCount++
+			atomic.AddInt32(&attemptCount, 1)
 		},
 	}
 	
@@ -616,10 +735,14 @@ func TestOTLPWriter_RetryLogic(t *testing.T) {
 	}
 	
 	require.NoError(t, w.Provision(ctx))
-	w.grpcClient = mockClient
 	
-	wc, err := w.OpenWriter()
+	// Get a test write closer
+	twc, err := w.openWriterForTest()
 	require.NoError(t, err)
+	defer twc.Close()
+	
+	// Set the mock client
+	twc.setGRPCClient(mockClient)
 	
 	// Write a log
 	log := map[string]interface{}{
@@ -627,17 +750,19 @@ func TestOTLPWriter_RetryLogic(t *testing.T) {
 		"msg":   "retry test",
 	}
 	data, _ := json.Marshal(log)
-	_, err = wc.Write(data)
+	_, err = twc.Write(data)
 	assert.NoError(t, err)
 	
 	// Wait for retries
 	time.Sleep(200 * time.Millisecond)
 	
 	// Verify retry happened and eventually succeeded
-	assert.Equal(t, 2, attemptCount)
-	assert.Equal(t, int64(1), atomic.LoadInt64(&w.sentBatches))
+	assert.Equal(t, int32(2), atomic.LoadInt32(&attemptCount))
 	
-	assert.NoError(t, w.Cleanup())
+	// Get the actual writer to check stats
+	aw := twc.getActualWriter()
+	assert.NotNil(t, aw)
+	assert.Equal(t, int64(1), atomic.LoadInt64(&aw.sentBatches))
 }
 
 // trackingMockClient is a mock that can fail a specified number of times
