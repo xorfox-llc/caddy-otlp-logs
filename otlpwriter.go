@@ -505,7 +505,16 @@ func (w *OTLPWriter) initGRPCClient() error {
 		opts = append(opts, grpc.WithUnaryInterceptor(w.grpcHeaderInterceptor()))
 	}
 
-	conn, err := grpc.Dial(w.Endpoint, opts...)
+	// Strip scheme from endpoint if present
+	endpoint := w.Endpoint
+	if u, err := url.Parse(endpoint); err == nil && u.Scheme != "" {
+		endpoint = u.Host
+		if endpoint == "" {
+			return fmt.Errorf("invalid endpoint: %s", w.Endpoint)
+		}
+	}
+
+	conn, err := grpc.Dial(endpoint, opts...)
 	if err != nil {
 		return fmt.Errorf("failed to dial gRPC endpoint: %w", err)
 	}
