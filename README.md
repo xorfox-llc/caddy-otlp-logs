@@ -10,6 +10,9 @@ This module provides a Caddy log writer that exports logs directly to an OpenTel
 - Trace context correlation (trace_id, span_id)
 - Resource attributes and semantic conventions
 - Structured log attributes preservation
+- TLS/mTLS support with custom certificates
+- Compression support (gzip)
+- Singleton pattern for configuration reload resilience
 
 ## Configuration
 
@@ -28,24 +31,107 @@ labels:
 
 ## Environment Variables
 
-The module respects standard OpenTelemetry environment variables:
+The module fully supports the standard OpenTelemetry environment variables as defined in the [OTLP specification](https://opentelemetry.io/docs/specs/otel/protocol/exporter/):
 
-- `OTEL_EXPORTER_OTLP_ENDPOINT` - Base endpoint for all signals
-- `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` - Specific endpoint for logs
-- `OTEL_EXPORTER_OTLP_PROTOCOL` - Protocol (grpc or http/protobuf)
-- `OTEL_EXPORTER_OTLP_LOGS_PROTOCOL` - Specific protocol for logs
-- `OTEL_EXPORTER_OTLP_HEADERS` - Headers to send with requests
-- `OTEL_EXPORTER_OTLP_LOGS_HEADERS` - Specific headers for logs
-- `OTEL_EXPORTER_OTLP_TIMEOUT` - Export timeout in milliseconds
-- `OTEL_EXPORTER_OTLP_LOGS_TIMEOUT` - Specific timeout for logs
-- `OTEL_EXPORTER_OTLP_INSECURE` - Disable TLS verification
-- `OTEL_EXPORTER_OTLP_LOGS_INSECURE` - Specific insecure setting for logs
-- `OTEL_SERVICE_NAME` - Service name resource attribute
-- `OTEL_RESOURCE_ATTRIBUTES` - Additional resource attributes
+### Endpoint Configuration
+- `OTEL_EXPORTER_OTLP_ENDPOINT` - Base endpoint URL for any signal type
+- `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` - Endpoint URL specifically for logs (takes precedence)
 
-## JSON Configuration
+### Protocol Configuration
+- `OTEL_EXPORTER_OTLP_PROTOCOL` - Transport protocol (`grpc` or `http/protobuf`)
+- `OTEL_EXPORTER_OTLP_LOGS_PROTOCOL` - Protocol specifically for logs (takes precedence)
 
-When using Caddy's JSON config:
+### Headers Configuration
+- `OTEL_EXPORTER_OTLP_HEADERS` - Headers as comma-separated key=value pairs
+- `OTEL_EXPORTER_OTLP_LOGS_HEADERS` - Headers specifically for logs (takes precedence)
+
+Example: `Authorization=Bearer token,X-Custom=value`
+
+### Security Configuration
+- `OTEL_EXPORTER_OTLP_INSECURE` - Set to `true` to disable TLS verification
+- `OTEL_EXPORTER_OTLP_LOGS_INSECURE` - Insecure mode specifically for logs (takes precedence)
+
+### Certificate Configuration
+- `OTEL_EXPORTER_OTLP_CERTIFICATE` - Path to CA certificate file
+- `OTEL_EXPORTER_OTLP_LOGS_CERTIFICATE` - CA certificate specifically for logs (takes precedence)
+- `OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE` - Path to client certificate for mTLS
+- `OTEL_EXPORTER_OTLP_CLIENT_KEY` - Path to client key for mTLS
+
+### Timeout Configuration
+- `OTEL_EXPORTER_OTLP_TIMEOUT` - Export timeout (e.g., `30s`, `1m`)
+- `OTEL_EXPORTER_OTLP_LOGS_TIMEOUT` - Timeout specifically for logs (takes precedence)
+
+### Compression Configuration
+- `OTEL_EXPORTER_OTLP_COMPRESSION` - Compression type (`gzip` or empty for none)
+- `OTEL_EXPORTER_OTLP_LOGS_COMPRESSION` - Compression specifically for logs (takes precedence)
+
+### Service Configuration
+- `OTEL_SERVICE_NAME` - Sets the service.name resource attribute
+- `OTEL_RESOURCE_ATTRIBUTES` - Additional resource attributes as comma-separated key=value pairs
+
+Example: `service.name=myapp,service.version=1.0.0,deployment.environment=prod`
+
+### Debug Configuration
+- `CADDY_OTLP_DEBUG` - Set to `true` to enable debug logging (Caddy-specific)
+
+### Precedence Rules
+1. Configuration values explicitly set in Caddyfile or JSON take precedence over environment variables
+2. Signal-specific environment variables (e.g., `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`) take precedence over general ones
+3. Empty environment variable values are treated the same as unset variables
+
+## Configuration Examples
+
+### Minimal Configuration with Environment Variables
+
+When using environment variables, your Caddyfile can be minimal:
+
+```caddyfile
+{
+    log {
+        output otlp
+    }
+}
+```
+
+Set environment variables:
+```bash
+export OTEL_EXPORTER_OTLP_ENDPOINT=https://otlp.example.com:4317
+export OTEL_SERVICE_NAME=my-caddy-service
+export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Bearer mytoken"
+caddy run
+```
+
+### Full Caddyfile Configuration
+
+```caddyfile
+{
+    log {
+        output otlp {
+            endpoint localhost:4317
+            protocol grpc
+            insecure true
+            timeout 30s
+            service_name my-service
+            batch_size 100
+            batch_timeout 5s
+            compression gzip
+            ca_cert /path/to/ca.crt
+            client_cert /path/to/client.crt
+            client_key /path/to/client.key
+            headers {
+                Authorization "Bearer token"
+                X-Custom-Header "value"
+            }
+            resource_attributes {
+                environment production
+                region us-west-2
+            }
+        }
+    }
+}
+```
+
+### JSON Configuration
 
 ```json
 {
@@ -64,7 +150,9 @@ When using Caddy's JSON config:
             "environment": "production"
           },
           "batch_size": 100,
-          "batch_timeout": "5s"
+          "batch_timeout": "5s",
+          "compression": "gzip",
+          "ca_cert": "/path/to/ca.crt"
         }
       }
     }

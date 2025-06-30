@@ -3,6 +3,8 @@ package otlplogs
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -26,6 +28,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	_ "google.golang.org/grpc/encoding/gzip" // Register gzip compressor
 	"google.golang.org/grpc/metadata"
 	collectorlogspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 )
@@ -83,6 +86,18 @@ type OTLPWriter struct {
 
 	// Debug enables verbose debug logging for troubleshooting.
 	Debug bool `json:"debug,omitempty"`
+
+	// Compression specifies the compression type (gzip or none).
+	Compression string `json:"compression,omitempty"`
+
+	// CACert is the path to CA certificate for TLS verification.
+	CACert string `json:"ca_cert,omitempty"`
+
+	// ClientCert is the path to client certificate for mTLS.
+	ClientCert string `json:"client_cert,omitempty"`
+
+	// ClientKey is the path to client key for mTLS.
+	ClientKey string `json:"client_key,omitempty"`
 
 	key string // computed key for singleton lookup
 }
@@ -149,12 +164,29 @@ func (w *OTLPWriter) Provision(ctx caddy.Context) error {
 		}
 	}
 
+	// Apply timeout from environment if not set
+	if w.Timeout == 0 {
+		if timeout := os.Getenv("OTEL_EXPORTER_OTLP_LOGS_TIMEOUT"); timeout != "" {
+			if d, err := time.ParseDuration(timeout); err == nil {
+				w.Timeout = caddy.Duration(d)
+			}
+		} else if timeout := os.Getenv("OTEL_EXPORTER_OTLP_TIMEOUT"); timeout != "" {
+			if d, err := time.ParseDuration(timeout); err == nil {
+				w.Timeout = caddy.Duration(d)
+			}
+		}
+	}
+	
 	// Set defaults
 	if w.Timeout == 0 {
 		w.Timeout = caddy.Duration(10 * time.Second)
 	}
 	if w.ServiceName == "" {
-		w.ServiceName = "caddy"
+		if svc := os.Getenv("OTEL_SERVICE_NAME"); svc != "" {
+			w.ServiceName = svc
+		} else {
+			w.ServiceName = "caddy"
+		}
 	}
 	if w.BatchSize == 0 {
 		w.BatchSize = 100
@@ -167,6 +199,46 @@ func (w *OTLPWriter) Provision(ctx caddy.Context) error {
 	}
 	if w.RetryDelay == 0 {
 		w.RetryDelay = caddy.Duration(1 * time.Second)
+	}
+
+	// Apply insecure setting from environment if not explicitly set
+	// Note: In Caddy config, false is the zero value, so we need to check if it was explicitly set
+	if !w.Insecure {
+		if insecure := os.Getenv("OTEL_EXPORTER_OTLP_LOGS_INSECURE"); insecure == "true" {
+			w.Insecure = true
+		} else if insecure := os.Getenv("OTEL_EXPORTER_OTLP_INSECURE"); insecure == "true" {
+			w.Insecure = true
+		}
+	}
+
+	// Apply compression from environment if not set
+	if w.Compression == "" {
+		if comp := os.Getenv("OTEL_EXPORTER_OTLP_LOGS_COMPRESSION"); comp != "" {
+			w.Compression = comp
+		} else if comp := os.Getenv("OTEL_EXPORTER_OTLP_COMPRESSION"); comp != "" {
+			w.Compression = comp
+		}
+	}
+
+	// Apply certificate paths from environment if not set
+	if w.CACert == "" {
+		if cert := os.Getenv("OTEL_EXPORTER_OTLP_LOGS_CERTIFICATE"); cert != "" {
+			w.CACert = cert
+		} else if cert := os.Getenv("OTEL_EXPORTER_OTLP_CERTIFICATE"); cert != "" {
+			w.CACert = cert
+		}
+	}
+
+	if w.ClientCert == "" {
+		if cert := os.Getenv("OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE"); cert != "" {
+			w.ClientCert = cert
+		}
+	}
+
+	if w.ClientKey == "" {
+		if key := os.Getenv("OTEL_EXPORTER_OTLP_CLIENT_KEY"); key != "" {
+			w.ClientKey = key
+		}
 	}
 
 	// Check for debug environment variable
@@ -606,7 +678,37 @@ func (w *actualOTLPWriter) initGRPCClient() error {
 	if w.config.Insecure {
 		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	} else {
-		opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(nil)))
+		// Set up TLS configuration
+		tlsConfig := &tls.Config{}
+		
+		// Load CA certificate if specified
+		if w.config.CACert != "" {
+			caCert, err := os.ReadFile(w.config.CACert)
+			if err != nil {
+				return fmt.Errorf("failed to read CA certificate: %w", err)
+			}
+			caCertPool := x509.NewCertPool()
+			if !caCertPool.AppendCertsFromPEM(caCert) {
+				return fmt.Errorf("failed to parse CA certificate")
+			}
+			tlsConfig.RootCAs = caCertPool
+		}
+		
+		// Load client certificate and key for mTLS if specified
+		if w.config.ClientCert != "" && w.config.ClientKey != "" {
+			clientCert, err := tls.LoadX509KeyPair(w.config.ClientCert, w.config.ClientKey)
+			if err != nil {
+				return fmt.Errorf("failed to load client certificate: %w", err)
+			}
+			tlsConfig.Certificates = []tls.Certificate{clientCert}
+		}
+		
+		opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
+	}
+
+	// Add compression if specified
+	if w.config.Compression == "gzip" {
+		opts = append(opts, grpc.WithDefaultCallOptions(grpc.UseCompressor("gzip")))
 	}
 
 	// Add headers via interceptor if specified
@@ -799,6 +901,30 @@ func (w *OTLPWriter) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				} else {
 					w.Debug = true
 				}
+
+			case "compression":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				w.Compression = d.Val()
+
+			case "ca_cert":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				w.CACert = d.Val()
+
+			case "client_cert":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				w.ClientCert = d.Val()
+
+			case "client_key":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				w.ClientKey = d.Val()
 
 			default:
 				return d.Errf("unrecognized subdirective: %s", d.Val())
