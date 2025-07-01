@@ -98,8 +98,25 @@ type OTLPWriter struct {
 
 	// ClientKey is the path to client key for mTLS.
 	ClientKey string `json:"client_key,omitempty"`
+	
+	// SwarmMode configures behavior when running in Docker Swarm mode.
+	// Options: "disabled" (default), "replica" (only first replica writes), 
+	// "hash" (consistent hash routing), "active" (all replicas write)
+	SwarmMode string `json:"swarm_mode,omitempty"`
 
 	key string // computed key for singleton lookup
+	
+	// swarmInfo holds detected swarm environment information
+	swarmInfo *swarmEnvironment
+}
+
+// swarmEnvironment contains Docker Swarm environment details
+type swarmEnvironment struct {
+	NodeID      string
+	ServiceName string
+	TaskSlot    string
+	TaskID      string
+	IsSwarmMode bool
 }
 
 // actualOTLPWriter is the actual implementation that handles OTLP export
@@ -274,6 +291,22 @@ func (w *OTLPWriter) Provision(ctx caddy.Context) error {
 	default:
 		return fmt.Errorf("unsupported protocol: %s (supported: grpc, http/protobuf)", w.Protocol)
 	}
+	
+	// Detect Docker Swarm environment
+	w.detectSwarmEnvironment()
+	
+	// Set default swarm mode if not specified
+	if w.SwarmMode == "" {
+		w.SwarmMode = "disabled"
+	}
+	
+	// Validate swarm mode
+	switch strings.ToLower(w.SwarmMode) {
+	case "disabled", "replica", "hash", "active":
+		// Valid modes
+	default:
+		return fmt.Errorf("unsupported swarm_mode: %s (supported: disabled, replica, hash, active)", w.SwarmMode)
+	}
 
 	// Compute the key for singleton lookup
 	w.key = w.WriterKey()
@@ -283,6 +316,15 @@ func (w *OTLPWriter) Provision(ctx caddy.Context) error {
 
 // OpenWriter returns a write closer that writes to the OTLP endpoint.
 func (w *OTLPWriter) OpenWriter() (io.WriteCloser, error) {
+	// In replica mode, only slot 1 writes; others get a no-op writer
+	if w.swarmInfo != nil && w.swarmInfo.IsSwarmMode && 
+		strings.ToLower(w.SwarmMode) == "replica" && w.swarmInfo.TaskSlot != "1" {
+		if w.Debug {
+			fmt.Fprintf(os.Stderr, "[DEBUG OTLP] Swarm replica mode: slot %s using no-op writer\n", w.swarmInfo.TaskSlot)
+		}
+		return &noOpWriteCloser{}, nil
+	}
+	
 	globalWritersMu.Lock()
 	defer globalWritersMu.Unlock()
 
@@ -315,6 +357,9 @@ func (w *OTLPWriter) OpenWriter() (io.WriteCloser, error) {
 
 	if w.Debug {
 		aw.debugf("created new OTLP writer: endpoint=%s", w.Endpoint)
+		if w.swarmInfo != nil && w.swarmInfo.IsSwarmMode {
+			aw.debugf("swarm mode: %s, node: %s, slot: %s", w.SwarmMode, w.swarmInfo.NodeID, w.swarmInfo.TaskSlot)
+		}
 	}
 
 	return &otlpWriteCloser{actualWriter: aw, key: w.key}, nil
@@ -328,7 +373,58 @@ func (w *OTLPWriter) Cleanup() error {
 
 // WriterKey returns a unique key for this writer configuration.
 func (w *OTLPWriter) WriterKey() string {
-	return fmt.Sprintf("otlp:%s:%s", w.Protocol, w.Endpoint)
+	baseKey := fmt.Sprintf("otlp:%s:%s", w.Protocol, w.Endpoint)
+	
+	// If not in swarm mode or swarm detection not enabled, return base key
+	if w.swarmInfo == nil || !w.swarmInfo.IsSwarmMode || w.SwarmMode == "disabled" {
+		return baseKey
+	}
+	
+	// Adjust key based on swarm mode strategy
+	switch strings.ToLower(w.SwarmMode) {
+	case "replica":
+		// Only slot 1 gets the base key, others get a readonly key
+		if w.swarmInfo.TaskSlot == "1" {
+			return baseKey
+		}
+		return fmt.Sprintf("%s:readonly:slot:%s", baseKey, w.swarmInfo.TaskSlot)
+		
+	case "hash":
+		// All instances use the same key for consistent hashing
+		return baseKey
+		
+	case "active":
+		// Each instance gets its own key to maintain separate singletons
+		return fmt.Sprintf("%s:node:%s:slot:%s", baseKey, w.swarmInfo.NodeID, w.swarmInfo.TaskSlot)
+		
+	default:
+		return baseKey
+	}
+}
+
+// detectSwarmEnvironment checks if running in Docker Swarm and populates swarm info
+func (w *OTLPWriter) detectSwarmEnvironment() {
+	// Check for Docker Swarm environment variables
+	nodeID := os.Getenv("DOCKER_NODE_ID")
+	serviceName := os.Getenv("DOCKER_SERVICE_NAME")
+	taskSlot := os.Getenv("DOCKER_TASK_SLOT")
+	taskID := os.Getenv("DOCKER_TASK_ID")
+	
+	// Only consider it swarm mode if we have the essential variables
+	if nodeID != "" && serviceName != "" {
+		w.swarmInfo = &swarmEnvironment{
+			NodeID:      nodeID,
+			ServiceName: serviceName,
+			TaskSlot:    taskSlot,
+			TaskID:      taskID,
+			IsSwarmMode: true,
+		}
+		
+		if w.Debug {
+			fmt.Fprintf(os.Stderr, "[DEBUG OTLP] Detected Docker Swarm environment: node=%s, service=%s, slot=%s\n",
+				nodeID, serviceName, taskSlot)
+		}
+	}
 }
 
 // String returns a string representation of the writer.
@@ -926,6 +1022,19 @@ func (w *OTLPWriter) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 				w.ClientKey = d.Val()
 
+			case "swarm_mode":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				w.SwarmMode = d.Val()
+				// Validate the value
+				switch strings.ToLower(w.SwarmMode) {
+				case "disabled", "replica", "hash", "active":
+					// Valid modes
+				default:
+					return d.Errf("invalid swarm_mode: %s (valid options: disabled, replica, hash, active)", w.SwarmMode)
+				}
+
 			default:
 				return d.Errf("unrecognized subdirective: %s", d.Val())
 			}
@@ -1101,6 +1210,19 @@ func parseSpanID(spanID string) []byte {
 		}
 	}
 	
+	return nil
+}
+
+// noOpWriteCloser is a writer that discards all input (used for non-primary replicas)
+type noOpWriteCloser struct{}
+
+func (n *noOpWriteCloser) Write(p []byte) (int, error) {
+	// Discard the data but return success
+	return len(p), nil
+}
+
+func (n *noOpWriteCloser) Close() error {
+	// Nothing to close
 	return nil
 }
 

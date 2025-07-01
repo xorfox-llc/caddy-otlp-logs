@@ -25,6 +25,7 @@ labels:
   caddy.log.output.protocol: grpc  # or "http/protobuf"
   caddy.log.output.endpoint: ${OTEL_ENDPOINT}:443
   caddy.log.output.insecure: false
+  caddy.log.output.swarm_mode: replica  # Options: disabled, replica, hash, active
   caddy.log.format: json
   caddy.log.level: INFO
 ```
@@ -115,6 +116,7 @@ caddy run
             batch_size 100
             batch_timeout 5s
             compression gzip
+            swarm_mode replica
             ca_cert /path/to/ca.crt
             client_cert /path/to/client.crt
             client_key /path/to/client.key
@@ -199,3 +201,55 @@ Logs are batched for performance:
 - Default batch size: 100 logs
 - Default batch timeout: 5 seconds
 - Batches are sent when full or on timeout
+
+## Docker Swarm Mode
+
+When running in Docker Swarm, the module can coordinate between replicas to control log export behavior. This is automatically detected when Docker Swarm environment variables are present (`DOCKER_NODE_ID`, `DOCKER_SERVICE_NAME`, etc.).
+
+### Swarm Mode Options
+
+Configure using the `swarm_mode` directive:
+
+```caddyfile
+{
+    log {
+        output otlp {
+            endpoint localhost:4317
+            swarm_mode replica  # Options: disabled, replica, hash, active
+        }
+    }
+}
+```
+
+#### Available Modes
+
+- **disabled** (default): No swarm coordination. Each instance maintains its own singleton.
+- **replica**: Only the primary replica (slot 1) sends logs. Other replicas discard logs.
+- **hash**: Not yet implemented. Will use consistent hashing to distribute log responsibility.
+- **active**: All replicas actively send logs (each maintains separate singletons).
+
+### Use Cases
+
+#### Single Writer Pattern (replica mode)
+Best for centralized logging where you want to avoid duplicate logs:
+```caddyfile
+swarm_mode replica
+```
+Only the primary replica (slot 1) will send logs to your OTLP endpoint.
+
+#### All Active Pattern (active mode)
+Best when you need high availability and can handle duplicate logs:
+```caddyfile
+swarm_mode active
+```
+All replicas send logs independently.
+
+### Environment Variables
+
+The module detects these Docker Swarm environment variables:
+- `DOCKER_NODE_ID`: The swarm node identifier
+- `DOCKER_SERVICE_NAME`: The service name
+- `DOCKER_TASK_SLOT`: The task slot number (1 for primary replica)
+- `DOCKER_TASK_ID`: Unique task identifier
+
+When these are present, the module adjusts its singleton key generation based on the configured swarm mode.
