@@ -19,8 +19,12 @@ import (
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
+	"go.opentelemetry.io/otel/trace"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	logspb "go.opentelemetry.io/proto/otlp/logs/v1"
 	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
@@ -47,6 +51,12 @@ type globalOTLPWriter struct {
 
 func init() {
 	caddy.RegisterModule(OTLPWriter{})
+	
+	// Configure global text map propagator with W3C Trace Context and Baggage
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{},
+		propagation.Baggage{},
+	))
 }
 
 // OTLPWriter implements a Caddy log writer configuration that sends logs via OTLP.
@@ -718,6 +728,32 @@ func (w *actualOTLPWriter) sendBatchWithRetry(logs []*logspb.LogRecord) {
 
 // sendBatch sends a batch of logs
 func (w *actualOTLPWriter) sendBatch(ctx context.Context, logs []*logspb.LogRecord) error {
+	// Extract trace context from the first log that has it
+	var traceID trace.TraceID
+	var spanID trace.SpanID
+	for _, log := range logs {
+		if len(log.TraceId) == 16 && len(log.SpanId) == 8 {
+			copy(traceID[:], log.TraceId)
+			copy(spanID[:], log.SpanId)
+			break
+		}
+	}
+	
+	// If we found trace context, create a span context and propagate it
+	if !traceID.IsValid() && !spanID.IsValid() {
+		// No trace context found, use the original context
+	} else {
+		// Create a span context from the trace and span IDs
+		spanCtx := trace.NewSpanContext(trace.SpanContextConfig{
+			TraceID: traceID,
+			SpanID:  spanID,
+			Remote:  true,
+		})
+		
+		// Inject the span context into the outgoing context
+		ctx = trace.ContextWithSpanContext(ctx, spanCtx)
+	}
+	
 	req := &collectorlogspb.ExportLogsServiceRequest{
 		ResourceLogs: []*logspb.ResourceLogs{
 			{
@@ -807,6 +843,9 @@ func (w *actualOTLPWriter) initGRPCClient() error {
 		opts = append(opts, grpc.WithDefaultCallOptions(grpc.UseCompressor("gzip")))
 	}
 
+	// Add OpenTelemetry instrumentation for trace propagation
+	opts = append(opts, grpc.WithStatsHandler(otelgrpc.NewClientHandler()))
+	
 	// Add headers via interceptor if specified
 	if len(w.config.Headers) > 0 {
 		opts = append(opts, grpc.WithUnaryInterceptor(w.grpcHeaderInterceptor()))
