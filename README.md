@@ -7,12 +7,13 @@ This module provides a Caddy log writer that exports logs directly to an OpenTel
 - Exports Caddy logs via OTLP gRPC (HTTP/protobuf support is planned)
 - Full support for OpenTelemetry environment variables
 - Automatic batching for efficient log export
-- Trace context correlation (trace_id, span_id)
+- Trace context correlation (supports both `trace_id`/`span_id` and `traceID`/`spanID` field names)
 - Resource attributes and semantic conventions
 - Structured log attributes preservation
 - TLS/mTLS support with custom certificates
 - Compression support (gzip)
 - Singleton pattern for configuration reload resilience
+- Built-in OpenTelemetry instrumentation with traces and metrics
 
 ## Configuration
 
@@ -183,7 +184,7 @@ xcaddy build \
 1. The module implements Caddy's `WriterOpener` interface
 2. Log entries are parsed from JSON format
 3. Logs are batched for efficient export
-4. Trace context is extracted from `trace_id` and `span_id` fields
+4. Trace context is extracted from log fields (supports both `trace_id`/`span_id` and `traceID`/`spanID`)
 5. All log attributes are preserved as OTLP attributes
 6. Logs are sent via gRPC to the OTLP endpoint
 
@@ -253,3 +254,38 @@ The module detects these Docker Swarm environment variables:
 - `DOCKER_TASK_ID`: Unique task identifier
 
 When these are present, the module adjusts its singleton key generation based on the configured swarm mode.
+
+## Telemetry
+
+The OTLP writer includes built-in OpenTelemetry instrumentation to provide observability into its operations.
+
+### Traces
+
+The module creates spans for key operations:
+- `otlp.Write`: Created for each write operation, includes log size
+- `otlp.sendBatch`: Created when sending a batch of logs, includes batch size
+- `otlp.sendBatchWithRetry`: Created when retries are needed, links to retry attempts
+
+### Metrics
+
+The following metrics are automatically collected:
+- `otlp.logs_exported`: Counter of successfully exported logs
+- `otlp.export_failures`: Counter of failed export attempts
+- `otlp.export_duration`: Histogram of export operation durations
+- `otlp.batch_size`: Histogram of batch sizes sent
+- `otlp.dropped_logs`: Counter of logs dropped due to full channels
+- `otlp.retry_attempts`: Counter of retry attempts made
+
+### Trace Context Propagation
+
+The module automatically propagates trace context from incoming logs to outgoing OTLP requests:
+- Supports both snake_case fields (`trace_id`, `span_id`) and camelCase fields (`traceID`, `spanID`)
+- Uses W3C Trace Context format for propagation
+- Enables distributed tracing across your entire system
+
+### Integration with OpenTelemetry
+
+The module uses the global OpenTelemetry providers configured in your application. To enable telemetry collection, configure OpenTelemetry SDK in your Caddy instance or use environment variables like:
+- `OTEL_TRACES_EXPORTER`: Configure trace exporter
+- `OTEL_METRICS_EXPORTER`: Configure metrics exporter
+- `OTEL_EXPORTER_OTLP_ENDPOINT`: Configure OTLP endpoint for telemetry

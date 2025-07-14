@@ -497,19 +497,35 @@ func (owc *otlpWriteCloser) Write(p []byte) (int, error) {
 	}
 	
 	// Extract trace context if present
+	// Check both snake_case (trace_id) and camelCase (traceID) as Caddy uses camelCase
 	var hasTraceContext bool
+	var traceIDStr string
 	if traceID, ok := entry["trace_id"].(string); ok {
-		if tid := parseTraceID(traceID); tid != nil {
+		traceIDStr = traceID
+	} else if traceID, ok := entry["traceID"].(string); ok {
+		traceIDStr = traceID
+	}
+	
+	if traceIDStr != "" {
+		if tid := parseTraceID(traceIDStr); tid != nil {
 			record.TraceId = tid
 			hasTraceContext = true
-			span.SetAttributes(attribute.String("log.trace_id", traceID))
+			span.SetAttributes(attribute.String("log.trace_id", traceIDStr))
 		}
 	}
+	
+	var spanIDStr string
 	if spanID, ok := entry["span_id"].(string); ok {
-		if sid := parseSpanID(spanID); sid != nil {
+		spanIDStr = spanID
+	} else if spanID, ok := entry["spanID"].(string); ok {
+		spanIDStr = spanID
+	}
+	
+	if spanIDStr != "" {
+		if sid := parseSpanID(spanIDStr); sid != nil {
 			record.SpanId = sid
 			hasTraceContext = true
-			span.SetAttributes(attribute.String("log.span_id", spanID))
+			span.SetAttributes(attribute.String("log.span_id", spanIDStr))
 		}
 	}
 	span.SetAttributes(attribute.Bool("log.has_trace_context", hasTraceContext))

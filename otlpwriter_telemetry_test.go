@@ -344,17 +344,37 @@ func TestTelemetryTraceContextPropagation(t *testing.T) {
 	require.NoError(t, err)
 	defer writer.Close()
 
-	// Write a log with trace context
-	logEntry := `{"level":"info","ts":1234567890,"msg":"test","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","span_id":"00f067aa0ba902b7"}`
-	_, err = writer.Write([]byte(logEntry))
-	require.NoError(t, err)
-
-	// Wait for processing
-	time.Sleep(200 * time.Millisecond)
-
-	// Verify trace context was propagated
-	assert.NotNil(t, receivedHeaders)
-	assert.NotEmpty(t, receivedHeaders.Get("traceparent"))
+	// Test both snake_case and camelCase field names
+	testCases := []struct {
+		name     string
+		logEntry string
+	}{
+		{
+			name:     "snake_case fields",
+			logEntry: `{"level":"info","ts":1234567890,"msg":"test","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","span_id":"00f067aa0ba902b7"}`,
+		},
+		{
+			name:     "camelCase fields (Caddy style)",
+			logEntry: `{"level":"info","ts":1234567890,"msg":"test","traceID":"4bf92f3577b34da6a3ce929d0e0e4736","spanID":"00f067aa0ba902b7"}`,
+		},
+	}
+	
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Reset received headers
+			receivedHeaders = nil
+			
+			_, err = writer.Write([]byte(tc.logEntry))
+			require.NoError(t, err)
+			
+			// Wait for processing
+			time.Sleep(200 * time.Millisecond)
+			
+			// Verify trace context was propagated
+			assert.NotNil(t, receivedHeaders, "Headers should be received for %s", tc.name)
+			assert.NotEmpty(t, receivedHeaders.Get("traceparent"), "Traceparent header should be present for %s", tc.name)
+		})
+	}
 }
 
 // TestTelemetryDroppedLogsMetric tests dropped logs metric recording
