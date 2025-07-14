@@ -22,6 +22,8 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
 	"go.opentelemetry.io/otel/trace"
@@ -152,6 +154,16 @@ type actualOTLPWriter struct {
 	// Stats
 	failedBatches int64
 	sentBatches   int64
+	
+	// Telemetry
+	tracer         trace.Tracer
+	meter          metric.Meter
+	logsExported   metric.Int64Counter
+	exportFailures metric.Int64Counter
+	exportDuration metric.Float64Histogram
+	batchSize      metric.Float64Histogram
+	droppedLogs    metric.Int64Counter
+	retryAttempts  metric.Int64Counter
 }
 
 // Interface guards
@@ -329,9 +341,8 @@ func (w *OTLPWriter) OpenWriter() (io.WriteCloser, error) {
 	// In replica mode, only slot 1 writes; others get a no-op writer
 	if w.swarmInfo != nil && w.swarmInfo.IsSwarmMode && 
 		strings.ToLower(w.SwarmMode) == "replica" && w.swarmInfo.TaskSlot != "1" {
-		if w.Debug {
-			fmt.Fprintf(os.Stderr, "[DEBUG OTLP] Swarm replica mode: slot %s using no-op writer\n", w.swarmInfo.TaskSlot)
-		}
+		// Important to log when using no-op writer
+		fmt.Fprintf(os.Stderr, "[INFO OTLP] Swarm replica mode: slot %s using no-op writer (only slot 1 sends logs)\n", w.swarmInfo.TaskSlot)
 		return &noOpWriteCloser{}, nil
 	}
 	
@@ -342,9 +353,8 @@ func (w *OTLPWriter) OpenWriter() (io.WriteCloser, error) {
 	gw, exists := globalWriters[w.key]
 	if exists {
 		gw.refCount++
-		if w.Debug {
-			gw.debugf("reusing existing OTLP writer: endpoint=%s, refcount=%d", w.Endpoint, gw.refCount)
-		}
+		// Log singleton reuse at info level for visibility
+		gw.infof("reusing existing OTLP writer: endpoint=%s, refcount=%d", w.Endpoint, gw.refCount)
 		return &otlpWriteCloser{actualWriter: gw.actualOTLPWriter, key: w.key}, nil
 	}
 
@@ -365,11 +375,10 @@ func (w *OTLPWriter) OpenWriter() (io.WriteCloser, error) {
 	}
 	globalWriters[w.key] = gw
 
-	if w.Debug {
-		aw.debugf("created new OTLP writer: endpoint=%s", w.Endpoint)
-		if w.swarmInfo != nil && w.swarmInfo.IsSwarmMode {
-			aw.debugf("swarm mode: %s, node: %s, slot: %s", w.SwarmMode, w.swarmInfo.NodeID, w.swarmInfo.TaskSlot)
-		}
+	// Log creation at info level for visibility
+	aw.infof("created new OTLP writer: endpoint=%s, protocol=%s, service=%s", w.Endpoint, w.Protocol, w.ServiceName)
+	if w.swarmInfo != nil && w.swarmInfo.IsSwarmMode {
+		aw.infof("swarm mode enabled: mode=%s, node=%s, slot=%s", w.SwarmMode, w.swarmInfo.NodeID, w.swarmInfo.TaskSlot)
 	}
 
 	return &otlpWriteCloser{actualWriter: aw, key: w.key}, nil
@@ -430,10 +439,9 @@ func (w *OTLPWriter) detectSwarmEnvironment() {
 			IsSwarmMode: true,
 		}
 		
-		if w.Debug {
-			fmt.Fprintf(os.Stderr, "[DEBUG OTLP] Detected Docker Swarm environment: node=%s, service=%s, slot=%s\n",
-				nodeID, serviceName, taskSlot)
-		}
+		// Always log swarm detection as it affects behavior
+		fmt.Fprintf(os.Stderr, "[INFO OTLP] Detected Docker Swarm environment: node=%s, service=%s, slot=%s, mode=%s\n",
+			nodeID, serviceName, taskSlot, w.SwarmMode)
 	}
 }
 
@@ -450,9 +458,19 @@ type otlpWriteCloser struct {
 
 // Write implements io.Writer
 func (owc *otlpWriteCloser) Write(p []byte) (int, error) {
+	ctx := context.Background()
+	ctx, span := owc.actualWriter.tracer.Start(ctx, "otlp.Write",
+		trace.WithAttributes(
+			attribute.Int("log.size", len(p)),
+		),
+	)
+	defer span.End()
+
 	// Parse the log entry
 	var entry map[string]interface{}
 	if err := json.Unmarshal(p, &entry); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to parse log entry")
 		owc.actualWriter.warnf("failed to parse log entry: %v", err)
 		return len(p), nil // Don't fail, just skip
 	}
@@ -467,6 +485,7 @@ func (owc *otlpWriteCloser) Write(p []byte) (int, error) {
 	if level, ok := entry["level"].(string); ok {
 		record.SeverityNumber = toSeverityNumber(level)
 		record.SeverityText = level
+		span.SetAttributes(attribute.String("log.level", level))
 	}
 	if ts, ok := entry["ts"].(float64); ok {
 		record.TimeUnixNano = uint64(ts * 1e9)
@@ -478,18 +497,25 @@ func (owc *otlpWriteCloser) Write(p []byte) (int, error) {
 	}
 	
 	// Extract trace context if present
+	var hasTraceContext bool
 	if traceID, ok := entry["trace_id"].(string); ok {
 		if tid := parseTraceID(traceID); tid != nil {
 			record.TraceId = tid
+			hasTraceContext = true
+			span.SetAttributes(attribute.String("log.trace_id", traceID))
 		}
 	}
 	if spanID, ok := entry["span_id"].(string); ok {
 		if sid := parseSpanID(spanID); sid != nil {
 			record.SpanId = sid
+			hasTraceContext = true
+			span.SetAttributes(attribute.String("log.span_id", spanID))
 		}
 	}
+	span.SetAttributes(attribute.Bool("log.has_trace_context", hasTraceContext))
 
 	owc.actualWriter.addLog(record)
+	span.SetStatus(codes.Ok, "log added to batch")
 	return len(p), nil
 }
 
@@ -504,9 +530,8 @@ func (owc *otlpWriteCloser) Close() error {
 	}
 
 	gw.refCount--
-	if gw.config.Debug {
-		gw.debugf("closing OTLP writer reference: endpoint=%s, refcount=%d", gw.config.Endpoint, gw.refCount)
-	}
+	// Log reference counting at info level for visibility
+	gw.infof("closing OTLP writer reference: endpoint=%s, refcount=%d", gw.config.Endpoint, gw.refCount)
 
 	if gw.refCount <= 0 {
 		// Last reference, clean up
@@ -520,6 +545,66 @@ func (owc *otlpWriteCloser) Close() error {
 // init initializes the actual OTLP writer
 func (w *actualOTLPWriter) init() error {
 	w.logger = zap.NewNop() // Use a no-op logger for now
+
+	// Initialize telemetry
+	w.tracer = otel.Tracer("caddy-otlp-logs", trace.WithInstrumentationVersion("1.0.0"))
+	w.meter = otel.Meter("caddy-otlp-logs", metric.WithInstrumentationVersion("1.0.0"))
+	
+	// Initialize metrics
+	var err error
+	w.logsExported, err = w.meter.Int64Counter(
+		"otlp_logs_exported_total",
+		metric.WithDescription("Total number of logs successfully exported"),
+		metric.WithUnit("1"),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create logs_exported metric: %w", err)
+	}
+	
+	w.exportFailures, err = w.meter.Int64Counter(
+		"otlp_export_failures_total",
+		metric.WithDescription("Total number of failed export attempts"),
+		metric.WithUnit("1"),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create export_failures metric: %w", err)
+	}
+	
+	w.exportDuration, err = w.meter.Float64Histogram(
+		"otlp_export_duration_seconds",
+		metric.WithDescription("Duration of export operations in seconds"),
+		metric.WithUnit("s"),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create export_duration metric: %w", err)
+	}
+	
+	w.batchSize, err = w.meter.Float64Histogram(
+		"otlp_batch_size",
+		metric.WithDescription("Size of log batches sent"),
+		metric.WithUnit("1"),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create batch_size metric: %w", err)
+	}
+	
+	w.droppedLogs, err = w.meter.Int64Counter(
+		"otlp_logs_dropped_total",
+		metric.WithDescription("Total number of logs dropped due to full channel"),
+		metric.WithUnit("1"),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create dropped_logs metric: %w", err)
+	}
+	
+	w.retryAttempts, err = w.meter.Int64Counter(
+		"otlp_retry_attempts_total",
+		metric.WithDescription("Total number of retry attempts"),
+		metric.WithUnit("1"),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create retry_attempts metric: %w", err)
+	}
 
 	// Create resource
 	attrs := []attribute.KeyValue{
@@ -567,10 +652,9 @@ func (w *actualOTLPWriter) init() error {
 	// Start worker
 	go w.worker()
 
-	if w.config.Debug {
-		w.debugf("OTLP log writer configured: endpoint=%s, protocol=%s, service_name=%s",
-			w.config.Endpoint, w.config.Protocol, w.config.ServiceName)
-	}
+	// Log configuration at info level
+	w.infof("OTLP log writer initialized: endpoint=%s, protocol=%s, service=%s, batch_size=%d, batch_timeout=%s",
+		w.config.Endpoint, w.config.Protocol, w.config.ServiceName, w.config.BatchSize, w.config.BatchTimeout)
 
 	return nil
 }
@@ -618,9 +702,11 @@ func (w *actualOTLPWriter) worker() {
 	defer ticker.Stop()
 	defer close(w.workerDone)
 
-	if w.config.Debug {
-		w.debugf("batch processor worker started: batch_timeout=%s", w.config.BatchTimeout)
-	}
+	// Status reporting ticker - report every 5 minutes
+	statusTicker := time.NewTicker(5 * time.Minute)
+	defer statusTicker.Stop()
+
+	w.infof("batch processor worker started: batch_size=%d, batch_timeout=%s", w.config.BatchSize, w.config.BatchTimeout)
 
 	for {
 		select {
@@ -637,16 +723,29 @@ func (w *actualOTLPWriter) worker() {
 				select {
 				case w.sendCh <- batch:
 				default:
+					if w.droppedLogs != nil {
+						ctx := context.Background()
+						w.droppedLogs.Add(ctx, int64(len(batch)),
+							metric.WithAttributes(
+								attribute.String("reason", "channel_full"),
+							),
+						)
+					}
 					w.warnf("send channel full, dropping batch of %d logs", len(batch))
 				}
 			} else {
 				w.mu.Unlock()
 			}
 			
+		case <-statusTicker.C:
+			// Report periodic status
+			sent := atomic.LoadInt64(&w.sentBatches)
+			failed := atomic.LoadInt64(&w.failedBatches)
+			w.infof("OTLP writer status: sent_batches=%d, failed_batches=%d, endpoint=%s", 
+				sent, failed, w.config.Endpoint)
+			
 		case <-w.stopCh:
-			if w.config.Debug {
-				w.debugf("worker received stop signal")
-			}
+			w.infof("worker received stop signal, performing final flush")
 			// Final flush
 			w.mu.Lock()
 			if len(w.logsBatch) > 0 {
@@ -695,19 +794,41 @@ func (w *actualOTLPWriter) addLog(record *logspb.LogRecord) {
 
 // sendBatchWithRetry sends a batch with retry logic
 func (w *actualOTLPWriter) sendBatchWithRetry(logs []*logspb.LogRecord) {
+	ctx := context.Background()
+	ctx, span := w.tracer.Start(ctx, "otlp.sendBatchWithRetry",
+		trace.WithAttributes(
+			attribute.Int("batch.size", len(logs)),
+			attribute.Int("max_retries", w.config.MaxRetries),
+		),
+	)
+	defer span.End()
+
 	var lastErr error
 	
 	for attempt := 0; attempt <= w.config.MaxRetries; attempt++ {
 		if attempt > 0 {
+			// Record retry attempt metric
+			if w.retryAttempts != nil {
+				w.retryAttempts.Add(ctx, 1,
+					metric.WithAttributes(
+						attribute.Int("attempt", attempt),
+					),
+				)
+			}
+
 			delay := time.Duration(w.config.RetryDelay) * time.Duration(attempt)
 			if w.config.Debug {
 				w.debugf("retrying batch send after %v (attempt %d/%d)", delay, attempt, w.config.MaxRetries)
 			}
+			span.AddEvent("retry_delay", trace.WithAttributes(
+				attribute.Int("attempt", attempt),
+				attribute.String("delay", delay.String()),
+			))
 			time.Sleep(delay)
 		}
 		
-		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(w.config.Timeout))
-		err := w.sendBatch(ctx, logs)
+		ctxTimeout, cancel := context.WithTimeout(ctx, time.Duration(w.config.Timeout))
+		err := w.sendBatch(ctxTimeout, logs)
 		cancel()
 		
 		if err == nil {
@@ -715,34 +836,66 @@ func (w *actualOTLPWriter) sendBatchWithRetry(logs []*logspb.LogRecord) {
 			if w.config.Debug {
 				w.debugf("successfully sent batch of %d logs", len(logs))
 			}
+			span.SetStatus(codes.Ok, "batch sent successfully")
+			span.SetAttributes(attribute.Int("attempts", attempt+1))
 			return
 		}
 		
 		lastErr = err
+		span.RecordError(err, trace.WithAttributes(
+			attribute.Int("attempt", attempt+1),
+		))
 		w.warnf("failed to send batch (attempt %d/%d): %v", attempt+1, w.config.MaxRetries, err)
 	}
 	
+	// All retries failed
 	atomic.AddInt64(&w.failedBatches, 1)
+	
+	// Record export failure metric
+	if w.exportFailures != nil {
+		w.exportFailures.Add(ctx, 1,
+			metric.WithAttributes(
+				attribute.String("reason", "max_retries_exceeded"),
+			),
+		)
+	}
+	
+	span.SetStatus(codes.Error, "max retries exceeded")
+	span.SetAttributes(attribute.Int("attempts", w.config.MaxRetries+1))
 	w.errorf("failed to send batch after %d attempts: %v", w.config.MaxRetries+1, lastErr)
 }
 
 // sendBatch sends a batch of logs
 func (w *actualOTLPWriter) sendBatch(ctx context.Context, logs []*logspb.LogRecord) error {
+	ctx, span := w.tracer.Start(ctx, "otlp.sendBatch",
+		trace.WithAttributes(
+			attribute.Int("batch.size", len(logs)),
+			attribute.String("protocol", w.config.Protocol),
+			attribute.String("endpoint", w.config.Endpoint),
+		),
+	)
+	defer span.End()
+
+	// Record batch size metric
+	if w.batchSize != nil {
+		w.batchSize.Record(ctx, float64(len(logs)))
+	}
+
 	// Extract trace context from the first log that has it
 	var traceID trace.TraceID
 	var spanID trace.SpanID
+	var hasTraceContext bool
 	for _, log := range logs {
 		if len(log.TraceId) == 16 && len(log.SpanId) == 8 {
 			copy(traceID[:], log.TraceId)
 			copy(spanID[:], log.SpanId)
+			hasTraceContext = true
 			break
 		}
 	}
 	
 	// If we found trace context, create a span context and propagate it
-	if !traceID.IsValid() && !spanID.IsValid() {
-		// No trace context found, use the original context
-	} else {
+	if hasTraceContext {
 		// Create a span context from the trace and span IDs
 		spanCtx := trace.NewSpanContext(trace.SpanContextConfig{
 			TraceID: traceID,
@@ -752,6 +905,7 @@ func (w *actualOTLPWriter) sendBatch(ctx context.Context, logs []*logspb.LogReco
 		
 		// Inject the span context into the outgoing context
 		ctx = trace.ContextWithSpanContext(ctx, spanCtx)
+		span.SetAttributes(attribute.Bool("propagated_context", true))
 	}
 	
 	req := &collectorlogspb.ExportLogsServiceRequest{
@@ -771,15 +925,47 @@ func (w *actualOTLPWriter) sendBatch(ctx context.Context, logs []*logspb.LogReco
 		},
 	}
 
+	// Record start time for duration metric
+	startTime := time.Now()
+	
+	var err error
 	switch strings.ToLower(w.config.Protocol) {
 	case "grpc":
-		_, err := w.grpcClient.Export(ctx, req)
-		return err
+		_, err = w.grpcClient.Export(ctx, req)
 	case "http/protobuf", "http":
-		return w.sendHTTPRequest(ctx, req)
+		err = w.sendHTTPRequest(ctx, req)
 	default:
-		return fmt.Errorf("unsupported protocol: %s", w.config.Protocol)
+		err = fmt.Errorf("unsupported protocol: %s", w.config.Protocol)
 	}
+
+	// Record export duration
+	duration := time.Since(startTime).Seconds()
+	if w.exportDuration != nil {
+		w.exportDuration.Record(ctx, duration,
+			metric.WithAttributes(
+				attribute.String("protocol", w.config.Protocol),
+				attribute.Bool("success", err == nil),
+			),
+		)
+	}
+
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "export failed")
+		return err
+	}
+
+	// Record successful export
+	if w.logsExported != nil {
+		w.logsExported.Add(ctx, int64(len(logs)),
+			metric.WithAttributes(
+				attribute.String("protocol", w.config.Protocol),
+			),
+		)
+	}
+
+	span.SetStatus(codes.Ok, "export successful")
+	return nil
 }
 
 // Helper methods for logging to stderr
