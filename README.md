@@ -4,7 +4,7 @@ This module provides a Caddy log writer that exports logs directly to an OpenTel
 
 ## Features
 
-- Exports Caddy logs via OTLP (gRPC or HTTP/protobuf)
+- Exports Caddy logs via OTLP gRPC (HTTP/protobuf support is planned)
 - Full support for OpenTelemetry environment variables
 - Automatic batching for efficient log export
 - Trace context correlation (trace_id, span_id)
@@ -22,7 +22,7 @@ The module can be configured using Docker labels when using caddy-docker-proxy:
 labels:
   caddy.log: default
   caddy.log.output: otlp
-  caddy.log.output.protocol: grpc  # or "http/protobuf"
+  caddy.log.output.protocol: grpc
   caddy.log.output.endpoint: ${OTEL_ENDPOINT}:443
   caddy.log.output.insecure: false
   caddy.log.output.swarm_mode: replica  # Options: disabled, replica, hash, active
@@ -39,7 +39,7 @@ The module fully supports the standard OpenTelemetry environment variables as de
 - `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` - Endpoint URL specifically for logs (takes precedence)
 
 ### Protocol Configuration
-- `OTEL_EXPORTER_OTLP_PROTOCOL` - Transport protocol (`grpc` or `http/protobuf`)
+- `OTEL_EXPORTER_OTLP_PROTOCOL` - Transport protocol (`grpc` only currently supported)
 - `OTEL_EXPORTER_OTLP_LOGS_PROTOCOL` - Protocol specifically for logs (takes precedence)
 
 ### Headers Configuration
@@ -109,7 +109,7 @@ caddy run
     log {
         output otlp {
             endpoint localhost:4317
-            protocol grpc
+            protocol grpc  # Note: http/protobuf is planned but not yet implemented
             insecure true
             timeout 30s
             service_name my-service
@@ -185,7 +185,7 @@ xcaddy build \
 3. Logs are batched for efficient export
 4. Trace context is extracted from `trace_id` and `span_id` fields
 5. All log attributes are preserved as OTLP attributes
-6. Logs are sent via gRPC or HTTP/protobuf to the OTLP endpoint
+6. Logs are sent via gRPC to the OTLP endpoint
 
 ## Log Format
 
